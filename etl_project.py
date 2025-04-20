@@ -1,6 +1,7 @@
 import sys
 import yaml
 import pandas as pd
+import dask.dataframe as dd
 import joblib
 import os
 import logging
@@ -13,6 +14,7 @@ from sqlalchemy import create_engine, text
 import psycopg2
 from prometheus_client import Counter, Histogram
 import xgboost as xgb
+from dask.distributed import Client
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_absolute_error
 from sklearn.preprocessing import LabelEncoder
@@ -24,6 +26,8 @@ import mlflow.xgboost
 import tkinter as tk
 from tkinter import ttk, scrolledtext, messagebox
 import threading
+import openpyxl
+from dask import delayed
 
 # Метрики Prometheus
 migrations_total = Counter('etl_migrations_total', 'Total number of ETL migrations')
@@ -56,19 +60,18 @@ def get_logger():
         logger.addHandler(slack_handler)
     return logger
 
-# Извлечение признаков из данных
-def extract_features(config, data=None):
-    if data is not None:
-        # Анализ данных из pandas DataFrame
-        num_cols = len(data.columns)
-        num_rows = len(data)
-        text_cols = sum(data.dtypes.apply(lambda x: x == "object"))
-        numeric_cols = sum(data.dtypes.apply(lambda x: x in [int, float]))
-        avg_row_size = data.memory_usage(deep=True).sum() / num_rows if num_rows > 0 else 0
-        total_amount = data['Сумма ВТ'].sum() if 'Сумма ВТ' in data.columns else 0
-        total_quantity = data['Количество'].sum() if 'Количество' in data.columns else 0
+# Извлечение признаков из данных (потоковый подход)
+def extract_features(config, data_chunks=None):
+    if data_chunks is not None:
+        # Для больших данных используем Dask
+        num_rows = data_chunks.shape[0].compute()
+        num_cols = len(data_chunks.columns)
+        text_cols = sum(data_chunks.dtypes.apply(lambda x: x == "object").compute())
+        numeric_cols = sum(data_chunks.dtypes.apply(lambda x: x in [int, float]).compute())
+        avg_row_size = data_chunks.memory_usage(deep=True).sum().compute() / num_rows if num_rows > 0 else 0
+        total_amount = data_chunks['Сумма ВТ'].sum().compute() if 'Сумма ВТ' in data_chunks.columns else 0
+        total_quantity = data_chunks['Количество'].sum().compute() if 'Количество' in data_chunks.columns else 0
     else:
-        # Анализ из базы данных
         engine = create_engine(config['source_db'])
         with engine.connect() as conn:
             num_cols = conn.execute(text(f"""
@@ -105,18 +108,16 @@ def extract_features(config, data=None):
         "total_quantity": total_quantity
     }
 
-# Предобработка данных
-def preprocess_data(df):
-    # Удаление дубликатов
-    df = df.drop_duplicates()
-    # Кодирование категориальных столбцов
+# Предобработка данных (потоковый подход)
+def preprocess_data(chunk):
+    chunk = chunk.drop_duplicates()
     le = LabelEncoder()
-    for col in df.select_dtypes(include=['object']).columns:
-        df[col] = le.fit_transform(df[col].astype(str))
-    return df
+    for col in chunk.select_dtypes(include=['object']).columns:
+        chunk[col] = le.fit_transform(chunk[col].astype(str))
+    return chunk
 
-# Валидация миграции
-def validate_migration(src_engine, tgt_engine, table, logger):
+# Валидация миграции (для больших данных используем выборки)
+def validate_migration(src_engine, tgt_engine, table, logger, sample_size=1000):
     with src_engine.connect() as src, tgt_engine.connect() as tgt:
         src_count = src.execute(text(f"SELECT COUNT(*) FROM {table}")).scalar()
         tgt_count = tgt.execute(text(f"SELECT COUNT(*) FROM {table}")).scalar()
@@ -124,21 +125,21 @@ def validate_migration(src_engine, tgt_engine, table, logger):
         if src_count != tgt_count:
             logger.warning("⚠️ Row count mismatch.")
             return False
-        src_sample = pd.read_sql(text(f"SELECT * FROM {table} ORDER BY RANDOM() LIMIT 100"), src)
-        tgt_sample = pd.read_sql(text(f"SELECT * FROM {table} ORDER BY RANDOM() LIMIT 100"), tgt)
+        src_sample = pd.read_sql(text(f"SELECT * FROM {table} ORDER BY RANDOM() LIMIT {sample_size}"), src)
+        tgt_sample = pd.read_sql(text(f"SELECT * FROM {table} ORDER BY RANDOM() LIMIT {sample_size}"), tgt)
         if not src_sample.equals(tgt_sample):
             logger.warning("⚠️ Data integrity mismatch in sampled rows.")
             return False
         logger.info("✅ Validation passed: row count and data integrity.")
         return True
 
-# Класс миграции
+# Класс миграции (с поддержкой больших данных)
 class ETLJob:
-    def __init__(self, config, data=None):
+    def __init__(self, config, data_chunks=None, client=None):
         self.config = config
-        self.data = preprocess_data(data) if data is not None else None
-        self.src_engine = create_engine(config['source_db']) if self.data is None else None
-        self.tgt_engine = create_engine(config['target_db'])
+        self.data_chunks = data_chunks
+        self.src_engine = create_engine(config['source_db'], pool_size=20, max_overflow=0) if self.data_chunks is None else None
+        self.tgt_engine = create_engine(config['target_db'], pool_size=20, max_overflow=0)
         self.table = config['table']
         self.chunk_size = config['chunk_size']
         self.commit_interval = config['commit_interval']
@@ -146,11 +147,15 @@ class ETLJob:
         self.logger = get_logger()
         self.total_rows = 0
         self.duration = 0
+        self.client = client  # Dask Client для распределённой обработки
 
     def stream_data(self):
-        if self.data is not None:
-            for i in range(0, len(self.data), self.chunk_size):
-                yield self.data[i:i + self.chunk_size]
+        if self.data_chunks is not None:
+            # Потоковая обработка с Dask
+            for partition in self.data_chunks.to_delayed():
+                chunk = partition.compute()
+                chunk = preprocess_data(chunk)
+                yield chunk
         else:
             with self.src_engine.connect().execution_options(stream_results=True) as conn:
                 result = conn.execution_options(yield_per=self.chunk_size).execute(text(f"SELECT * FROM {self.table}"))
@@ -191,7 +196,13 @@ class ETLJob:
 
             with self.tgt_engine.begin() as tgt_conn:
                 chunks = self.stream_data()
-                if parallel:
+                if parallel and self.client:
+                    # Распределённая миграция с Dask
+                    tasks = [delayed(self._migrate_chunk)(chunk, self.tgt_engine) for chunk in chunks]
+                    self.client.compute(tasks)
+                    for chunk in chunks:
+                        self.total_rows += len(chunk)
+                elif parallel:
                     with ThreadPoolExecutor(max_workers=self.parallel_chunks) as executor:
                         for chunk in chunks:
                             buffer.append(chunk)
@@ -218,25 +229,25 @@ class ETLJob:
                 conn.execute(text(f"CREATE INDEX IF NOT EXISTS idx_{self.table}_id ON {self.table} (id)"))
                 self.logger.info(f"📈 Index added on {self.table}.id")
 
-            if self.data is None:
+            if self.data_chunks is None:
                 validate_migration(self.src_engine, self.tgt_engine, self.table, self.logger)
 
         except Exception as e:
             self.logger.error(f"❌ ETL failed: {e}")
             raise
 
-# Генетический алгоритм
-def migrate_once(chunk_size, commit_interval, config, data=None):
+# Генетический алгоритм (оптимизирован для больших данных)
+def migrate_once(chunk_size, commit_interval, config, data_chunks=None, client=None):
     start = time.time()
     config['chunk_size'] = chunk_size
     config['commit_interval'] = commit_interval
-    job = ETLJob(config, data)
-    job.run()
+    job = ETLJob(config, data_chunks, client)
+    job.run(parallel=True)
     
     duration = time.time() - start
-    data_loss = 0  # Для упрощения, в реальном коде нужно сравнивать данные
+    data_loss = 0  # Упрощение для больших данных
     total_amount = config.get('features', {}).get('total_amount', 0)
-    fitness = (1.0 / (duration + 1)) * (1 - data_loss) * (1 + total_amount / 1e6)  # Учитываем объём транзакций
+    fitness = (1.0 / (duration + 1)) * (1 - data_loss) * (1 + total_amount / 1e9)  # Учитываем объём транзакций
     
     feats = config.get('features', {})
     result = {
@@ -268,15 +279,15 @@ def migrate_once(chunk_size, commit_interval, config, data=None):
     
     return fitness
 
-def genetic_algorithm(config, data=None, pop_size=6, generations=4, initial_params=None):
+def genetic_algorithm(config, data_chunks=None, client=None, pop_size=4, generations=2, initial_params=None):
     if initial_params:
         population = [[initial_params[0], initial_params[1]]]
-        population.extend([[random.choice([5000, 10000, 20000]), random.choice([10000, 20000, 50000])] for _ in range(pop_size-1)])
+        population.extend([[random.choice([50000, 100000, 200000]), random.choice([100000, 200000, 500000])] for _ in range(pop_size-1)])
     else:
-        population = [[random.choice([5000, 10000, 20000]), random.choice([10000, 20000, 50000])] for _ in range(pop_size)]
+        population = [[random.choice([50000, 100000, 200000]), random.choice([100000, 200000, 500000])] for _ in range(pop_size)]
     
     for gen in range(generations):
-        scored = [(migrate_once(p[0], p[1], config, data), p) for p in population]
+        scored = [(migrate_once(p[0], p[1], config, data_chunks, client), p) for p in population]
         scored.sort(reverse=True)
         best = scored[0][1]
         print(f"Gen {gen+1}: best={best}")
@@ -286,14 +297,14 @@ def genetic_algorithm(config, data=None, pop_size=6, generations=4, initial_para
             p1, p2 = random.sample(elites, 2)
             child = [
                 random.choice([p1[0], p2[0]]),
-                int((p1[1] + p2[1]) / 2 + random.randint(-5000, 5000))
+                int((p1[1] + p2[1]) / 2 + random.randint(-50000, 50000))
             ]
             children.append(child)
         population = elites + children
     return best
 
-# Обучение ML-модели (XGBoost)
-def train_model(data=None):
+# Обучение ML-модели (с поддержкой больших данных)
+def train_model(data_chunks=None):
     try:
         mlflow.set_experiment("etl_migration_optimization")
     except Exception as e:
@@ -304,6 +315,13 @@ def train_model(data=None):
     except FileNotFoundError:
         print("❌ Файл dataset.csv не найден. Создайте его с помощью миграции.")
         return
+
+    # Если есть новые данные, используем подвыборку для обучения
+    if data_chunks is not None:
+        sample = data_chunks.sample(frac=0.0001).compute()  # 0.01% данных
+        feats = extract_features({}, data_chunks)
+        sample = pd.DataFrame([feats])
+        df = pd.concat([df, sample], ignore_index=True)
 
     X = df.drop(columns=["best_batch", "best_commit", "duration", "data_loss"])
     y_batch = df["best_batch"]
@@ -347,9 +365,9 @@ def load_config(path='config.yaml'):
     return config
 
 # Основная функция миграции
-def run_etl(config, data=None, parallel=True):
+def run_etl(config, data_chunks=None, parallel=True, client=None):
     if config.get("optimize", False):
-        feats = extract_features(config, data)
+        feats = extract_features(config, data_chunks)
         config['features'] = feats
         feats_df = pd.DataFrame([feats])
         
@@ -364,12 +382,12 @@ def run_etl(config, data=None, parallel=True):
         pred_commit = int(model_commit.predict(feats_df)[0])
         
         # Оптимизация с помощью ГА
-        best_params = genetic_algorithm(config, data, initial_params=[pred_batch, pred_commit])
+        best_params = genetic_algorithm(config, data_chunks, client, initial_params=[pred_batch, pred_commit])
         config['chunk_size'] = best_params[0]
         config['commit_interval'] = best_params[1]
         print(f"🤖 Оптимизированные параметры: batch = {best_params[0]}, commit = {best_params[1]}")
 
-    job = ETLJob(config, data)
+    job = ETLJob(config, data_chunks, client)
     job.run(parallel=parallel)
     return {"status": "success", "rows_migrated": job.total_rows, "duration": job.duration}
 
@@ -397,13 +415,17 @@ async def health():
 class ETLApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("ETL Migration Tool")
+        self.root.title("ETL Migration Tool (Big Data)")
         self.logger = get_logger()
         self.config = load_config()
-        self.data = None
+        self.data_chunks = None
+        self.client = None
 
         # Элементы интерфейса
-        tk.Label(root, text="ETL Migration Tool", font=("Arial", 16)).pack(pady=10)
+        tk.Label(root, text="ETL Migration Tool (Big Data)", font=("Arial", 16)).pack(pady=10)
+
+        # Настройка Dask кластера
+        tk.Button(root, text="Инициализировать Dask кластер", command=self.init_dask).pack(pady=5)
 
         # Загрузка данных
         tk.Button(root, text="Загрузить данные (Excel)", command=self.load_data).pack(pady=5)
@@ -427,10 +449,18 @@ class ETLApp:
         self.log_area.yview(tk.END)
         self.logger.info(message)
 
+    def init_dask(self):
+        try:
+            self.client = Client(n_workers=4, threads_per_worker=2)
+            self.log(f"Dask кластер инициализирован: {self.client}")
+        except Exception as e:
+            messagebox.showerror("Ошибка", f"Не удалось инициализировать Dask: {str(e)}")
+
     def load_data(self):
         try:
-            self.data = pd.read_excel("Book1.xlsx")
-            self.log(f"Данные загружены: {len(self.data)} строк, {len(self.data.columns)} столбцов.")
+            # Потоковая загрузка больших данных
+            self.data_chunks = dd.from_pandas(pd.read_excel("Book1.xlsx", engine='openpyxl'), npartitions=100)
+            self.log(f"Данные загружены (Dask): {len(self.data_chunks)} строк, {len(self.data_chunks.columns)} столбцов.")
         except Exception as e:
             messagebox.showerror("Ошибка", f"Не удалось загрузить данные: {str(e)}")
 
@@ -440,7 +470,7 @@ class ETLApp:
     def _train_model(self):
         self.log("Начало обучения модели...")
         self.progress["value"] = 0
-        train_model(self.data)
+        train_model(self.data_chunks)
         self.log("Модель обучена.")
         self.progress["value"] = 100
 
@@ -448,13 +478,13 @@ class ETLApp:
         threading.Thread(target=self._run_migration, daemon=True).start()
 
     def _run_migration(self):
-        if self.data is None:
+        if self.data_chunks is None:
             messagebox.showwarning("Предупреждение", "Сначала загрузите данные.")
             return
         self.log("Запуск миграции...")
         self.progress["value"] = 0
         try:
-            result = run_etl(self.config, self.data, parallel=True)
+            result = run_etl(self.config, self.data_chunks, parallel=True, client=self.client)
             self.log(f"Миграция завершена: {result}")
             self.progress["value"] = 100
         except Exception as e:

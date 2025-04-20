@@ -1,8 +1,8 @@
 source_db: "postgresql+psycopg2://{SOURCE_DB_USER}:{SOURCE_DB_PASS}@{SOURCE_DB_HOST}:{SOURCE_DB_PORT}/{SOURCE_DB_NAME}"
 target_db: "postgresql+psycopg2://{TARGET_DB_USER}:{TARGET_DB_PASS}@{TARGET_DB_HOST}:{TARGET_DB_PORT}/{TARGET_DB_NAME}"
 table: "financial_transactions"
-chunk_size: 10000
-commit_interval: 20000
+chunk_size: 100000  # Увеличен для больших данных
+commit_interval: 200000
 optimize: true
-parallel_chunks: 4
+parallel_chunks: 8
 api_port: 8000

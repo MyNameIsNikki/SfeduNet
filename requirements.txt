@@ -1,4 +1,6 @@
 pandas
+dask[complete]
+openpyxl
 sqlalchemy
 psycopg2-binary
 pyyaml
