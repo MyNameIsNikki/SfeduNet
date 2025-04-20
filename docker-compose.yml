@@ -1,0 +1,74 @@
+version: '3.8'
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+      - "5000:5000"
+    volumes:
+      - ./logs:/app/logs
+      - ./ml_model:/app/ml_model
+    environment:
+      - API_PORT=8000
+      - SLACK_WEBHOOK_URL=${SLACK_WEBHOOK_URL}
+      - SOURCE_DB_USER=source_user
+      - SOURCE_DB_PASS=source_pass
+      - SOURCE_DB_HOST=source_db
+      - SOURCE_DB_PORT=5432
+      - SOURCE_DB_NAME=source_db
+      - TARGET_DB_USER=target_user
+      - TARGET_DB_PASS=target_pass
+      - TARGET_DB_HOST=target_db
+      - TARGET_DB_PORT=5432
+      - TARGET_DB_NAME=target_db
+    depends_on:
+      - source_db
+      - target_db
+    networks:
+      - etl_network
+
+  source_db:
+    image: postgres:14
+    environment:
+      - POSTGRES_USER=source_user
+      - POSTGRES_PASSWORD=source_pass
+      - POSTGRES_DB=source_db
+    volumes:
+      - source_db_data:/var/lib/postgresql/data
+    ports:
+      - "5433:5432"
+    networks:
+      - etl_network
+
+  target_db:
+    image: postgres:14
+    environment:
+      - POSTGRES_USER=target_user
+      - POSTGRES_PASSWORD=target_pass
+      - POSTGRES_DB=target_db
+    volumes:
+      - target_db_data:/var/lib/postgresql/data
+    ports:
+      - "5434:5432"
+    networks:
+      - etl_network
+
+  prometheus:
+    image: prom/prometheus:latest
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+    ports:
+      - "9090:9090"
+    networks:
+      - etl_network
+
+volumes:
+  source_db_data:
+  target_db_data:
+
+networks:
+  etl_network:
+    driver: bridge

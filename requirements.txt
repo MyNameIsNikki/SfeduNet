@@ -1,0 +1,12 @@
+pandas
+sqlalchemy
+psycopg2-binary
+pyyaml
+joblib
+xgboost
+prometheus-client
+requests
+fastapi
+uvicorn
+mlflow
+python-tk
