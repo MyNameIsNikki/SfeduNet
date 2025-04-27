@@ -28,6 +28,12 @@ from tkinter import ttk, scrolledtext, messagebox
 import threading
 import openpyxl
 from dask import delayed
+from tenacity import retry, stop_after_attempt, wait_exponential
+import gc
+
+# Настройка Dask для использования диска
+import dask
+dask.config.set({'temporary_directory': '/tmp', 'array.chunk-size': '128MiB'})
 
 # Метрики Prometheus
 migrations_total = Counter('etl_migrations_total', 'Total number of ETL migrations')
@@ -63,7 +69,6 @@ def get_logger():
 # Извлечение признаков из данных (потоковый подход)
 def extract_features(config, data_chunks=None):
     if data_chunks is not None:
-        # Для больших данных используем Dask
         num_rows = data_chunks.shape[0].compute()
         num_cols = len(data_chunks.columns)
         text_cols = sum(data_chunks.dtypes.apply(lambda x: x == "object").compute())
@@ -144,18 +149,23 @@ class ETLJob:
         self.chunk_size = config['chunk_size']
         self.commit_interval = config['commit_interval']
         self.parallel_chunks = config.get('parallel_chunks', 1)
+        self.retry_attempts = config.get('retry_attempts', 3)
         self.logger = get_logger()
         self.total_rows = 0
+        self.total_rows_expected = len(data_chunks) if data_chunks is not None else 0
+        self.progress_callback = config.get('progress_callback', None)
         self.duration = 0
-        self.client = client  # Dask Client для распределённой обработки
+        self.client = client
 
     def stream_data(self):
         if self.data_chunks is not None:
-            # Потоковая обработка с Dask
             for partition in self.data_chunks.to_delayed():
                 chunk = partition.compute()
                 chunk = preprocess_data(chunk)
                 yield chunk
+                # Очистка памяти
+                del chunk
+                gc.collect()
         else:
             with self.src_engine.connect().execution_options(stream_results=True) as conn:
                 result = conn.execution_options(yield_per=self.chunk_size).execute(text(f"SELECT * FROM {self.table}"))
@@ -174,13 +184,14 @@ class ETLJob:
         cursor.copy_from(output, self.table, sep='\t', null='')
         conn.commit()
 
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
     def _migrate_chunk(self, chunk, tgt_conn):
         try:
             with tgt_conn.connect() as conn:
                 self._copy_to_postgres(chunk, conn.raw_connection())
                 rows_migrated.inc(len(chunk))
         except Exception as e:
-            self.logger.error(f"Ошибка миграции чанка: {e}")
+            self.logger.error(f"Ошибка миграции чанка: {e}. Повторная попытка...")
             raise
 
     def run(self, parallel=False):
@@ -191,17 +202,21 @@ class ETLJob:
 
         try:
             with self.tgt_engine.connect() as conn:
+                conn.execute(text(f"CREATE UNLOGGED TABLE IF NOT EXISTS {self.table} (LIKE financial_transactions INCLUDING ALL)"))
                 conn.execute(text(f"DELETE FROM {self.table}"))
                 self.logger.info(f"🧹 Target table '{self.table}' cleared.")
+                conn.execute(text("SET maintenance_work_mem = '1GB'"))
+                conn.execute(text("SET max_parallel_maintenance_workers = 4"))
 
             with self.tgt_engine.begin() as tgt_conn:
                 chunks = self.stream_data()
                 if parallel and self.client:
-                    # Распределённая миграция с Dask
                     tasks = [delayed(self._migrate_chunk)(chunk, self.tgt_engine) for chunk in chunks]
                     self.client.compute(tasks)
                     for chunk in chunks:
                         self.total_rows += len(chunk)
+                        if self.progress_callback and self.total_rows_expected > 0:
+                            self.progress_callback(self.total_rows / self.total_rows_expected * 100)
                 elif parallel:
                     with ThreadPoolExecutor(max_workers=self.parallel_chunks) as executor:
                         for chunk in chunks:
@@ -209,6 +224,8 @@ class ETLJob:
                             self.total_rows += len(chunk)
                             if self.total_rows % self.commit_interval < self.chunk_size:
                                 executor.submit(self._migrate_chunk, pd.concat(buffer), tgt_conn)
+                                if self.progress_callback and self.total_rows_expected > 0:
+                                    self.progress_callback(self.total_rows / self.total_rows_expected * 100)
                                 buffer = []
                 else:
                     for chunk in chunks:
@@ -216,16 +233,21 @@ class ETLJob:
                         self.total_rows += len(chunk)
                         if self.total_rows % self.commit_interval < self.chunk_size:
                             self._copy_to_postgres(pd.concat(buffer), tgt_conn.raw_connection())
+                            if self.progress_callback and self.total_rows_expected > 0:
+                                self.progress_callback(self.total_rows / self.total_rows_expected * 100)
                             buffer = []
 
                 if buffer:
                     self._copy_to_postgres(pd.concat(buffer), tgt_conn.raw_connection())
+                    if self.progress_callback and self.total_rows_expected > 0:
+                        self.progress_callback(self.total_rows / self.total_rows_expected * 100)
 
             self.duration = round(time.time() - start, 2)
             migration_duration.observe(self.duration)
             self.logger.info(f"✅ ETL finished in {self.duration}s, {self.total_rows} rows migrated.")
             
             with self.tgt_engine.connect() as conn:
+                conn.execute(text(f"ALTER TABLE {self.table} SET LOGGED"))
                 conn.execute(text(f"CREATE INDEX IF NOT EXISTS idx_{self.table}_id ON {self.table} (id)"))
                 self.logger.info(f"📈 Index added on {self.table}.id")
 
@@ -245,9 +267,9 @@ def migrate_once(chunk_size, commit_interval, config, data_chunks=None, client=N
     job.run(parallel=True)
     
     duration = time.time() - start
-    data_loss = 0  # Упрощение для больших данных
+    data_loss = 0
     total_amount = config.get('features', {}).get('total_amount', 0)
-    fitness = (1.0 / (duration + 1)) * (1 - data_loss) * (1 + total_amount / 1e9)  # Учитываем объём транзакций
+    fitness = (1.0 / (duration + 1)) * (1 - data_loss) * (1 + total_amount / 1e9)
     
     feats = config.get('features', {})
     result = {
@@ -316,9 +338,8 @@ def train_model(data_chunks=None):
         print("❌ Файл dataset.csv не найден. Создайте его с помощью миграции.")
         return
 
-    # Если есть новые данные, используем подвыборку для обучения
     if data_chunks is not None:
-        sample = data_chunks.sample(frac=0.0001).compute()  # 0.01% данных
+        sample = data_chunks.sample(frac=0.0001).compute()
         feats = extract_features({}, data_chunks)
         sample = pd.DataFrame([feats])
         df = pd.concat([df, sample], ignore_index=True)
@@ -381,7 +402,6 @@ def run_etl(config, data_chunks=None, parallel=True, client=None):
         pred_batch = int(model_batch.predict(feats_df)[0])
         pred_commit = int(model_commit.predict(feats_df)[0])
         
-        # Оптимизация с помощью ГА
         best_params = genetic_algorithm(config, data_chunks, client, initial_params=[pred_batch, pred_commit])
         config['chunk_size'] = best_params[0]
         config['commit_interval'] = best_params[1]
@@ -427,8 +447,25 @@ class ETLApp:
         # Настройка Dask кластера
         tk.Button(root, text="Инициализировать Dask кластер", command=self.init_dask).pack(pady=5)
 
+        # Формат данных
+        tk.Label(root, text="Формат данных:").pack()
+        self.file_format = tk.StringVar(value="Excel")
+        tk.Radiobutton(root, text="Excel", variable=self.file_format, value="Excel").pack()
+        tk.Radiobutton(root, text="Parquet", variable=self.file_format, value="Parquet").pack()
+
         # Загрузка данных
-        tk.Button(root, text="Загрузить данные (Excel)", command=self.load_data).pack(pady=5)
+        tk.Button(root, text="Загрузить данные", command=self.load_data).pack(pady=5)
+
+        # Параметры миграции
+        tk.Label(root, text="Chunk Size:").pack()
+        self.chunk_size_entry = tk.Entry(root)
+        self.chunk_size_entry.insert(0, str(self.config.get("chunk_size", 10000)))
+        self.chunk_size_entry.pack()
+
+        tk.Label(root, text="Commit Interval:").pack()
+        self.commit_interval_entry = tk.Entry(root)
+        self.commit_interval_entry.insert(0, str(self.config.get("commit_interval", 20000)))
+        self.commit_interval_entry.pack()
 
         # Обучение модели
         tk.Button(root, text="Обучить модель", command=self.train_model).pack(pady=5)
@@ -458,8 +495,10 @@ class ETLApp:
 
     def load_data(self):
         try:
-            # Потоковая загрузка больших данных
-            self.data_chunks = dd.from_pandas(pd.read_excel("Book1.xlsx", engine='openpyxl'), npartitions=100)
+            if self.file_format.get() == "Excel":
+                self.data_chunks = dd.from_pandas(pd.read_excel("Book1.xlsx", engine='openpyxl'), npartitions=100)
+            else:
+                self.data_chunks = dd.read_parquet("large_financial_data.parquet")
             self.log(f"Данные загружены (Dask): {len(self.data_chunks)} строк, {len(self.data_chunks.columns)} столбцов.")
         except Exception as e:
             messagebox.showerror("Ошибка", f"Не удалось загрузить данные: {str(e)}")
@@ -484,6 +523,13 @@ class ETLApp:
         self.log("Запуск миграции...")
         self.progress["value"] = 0
         try:
+            self.config['chunk_size'] = int(self.chunk_size_entry.get())
+            self.config['commit_interval'] = int(self.commit_interval_entry.get())
+            def update_progress(value):
+                self.progress["value"] = value
+                self.root.update_idletasks()
+
+            self.config['progress_callback'] = update_progress
             result = run_etl(self.config, self.data_chunks, parallel=True, client=self.client)
             self.log(f"Миграция завершена: {result}")
             self.progress["value"] = 100
