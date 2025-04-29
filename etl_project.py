@@ -1,56 +1,22 @@
 import sys
 import yaml
 import pandas as pd
-import dask.dataframe as dd
-import joblib
 import os
 import logging
-import requests
-import random
 import time
-from io import StringIO
-from concurrent.futures import ThreadPoolExecutor
-from sqlalchemy import create_engine, text
-import psycopg2
-from prometheus_client import Counter, Histogram
-import xgboost as xgb
-from dask.distributed import Client
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import mean_absolute_error
-from sklearn.preprocessing import LabelEncoder
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-import uvicorn
-import mlflow
-import mlflow.xgboost
-import tkinter as tk
-from tkinter import ttk, scrolledtext, messagebox
-import threading
-import openpyxl
-from dask import delayed
-from tenacity import retry, stop_after_attempt, wait_exponential
 import gc
-
-# Настройка Dask для использования диска
-import dask
-dask.config.set({'temporary_directory': '/tmp', 'array.chunk-size': '128MiB'})
-
-# Метрики Prometheus
-migrations_total = Counter('etl_migrations_total', 'Total number of ETL migrations')
-migration_duration = Histogram('etl_migration_duration_seconds', 'Duration of ETL migrations')
-rows_migrated = Counter('etl_rows_migrated_total', 'Total rows migrated')
+import sqlalchemy as sa
+import psycopg2
+import mysql.connector
+import traceback
+import xlsxwriter
+import tkinter as tk
+from tkinter import ttk, scrolledtext, messagebox, filedialog
+import threading
+from tenacity import retry, stop_after_attempt, wait_exponential
+from openpyxl import load_workbook
 
 # Логирование
-class SlackHandler(logging.Handler):
-    def __init__(self, webhook_url):
-        super().__init__()
-        self.webhook_url = webhook_url
-
-    def emit(self, record):
-        if record.levelno >= logging.ERROR:
-            msg = self.format(record)
-            requests.post(self.webhook_url, json={"text": msg})
-
 def get_logger():
     logger = logging.getLogger("ETL")
     logger.setLevel(logging.INFO)
@@ -59,317 +25,227 @@ def get_logger():
     formatter = logging.Formatter("%(asctime)s — %(levelname)s — %(message)s")
     fh.setFormatter(formatter)
     logger.addHandler(fh)
-    slack_webhook = os.getenv("SLACK_WEBHOOK_URL", "")
-    if slack_webhook:
-        slack_handler = SlackHandler(slack_webhook)
-        slack_handler.setFormatter(formatter)
-        logger.addHandler(slack_handler)
     return logger
 
-# Извлечение признаков из данных (потоковый подход)
-def extract_features(config, data_chunks=None):
-    if data_chunks is not None:
-        num_rows = data_chunks.shape[0].compute()
-        num_cols = len(data_chunks.columns)
-        text_cols = sum(data_chunks.dtypes.apply(lambda x: x == "object").compute())
-        numeric_cols = sum(data_chunks.dtypes.apply(lambda x: x in [int, float]).compute())
-        avg_row_size = data_chunks.memory_usage(deep=True).sum().compute() / num_rows if num_rows > 0 else 0
-        total_amount = data_chunks['Сумма ВТ'].sum().compute() if 'Сумма ВТ' in data_chunks.columns else 0
-        total_quantity = data_chunks['Количество'].sum().compute() if 'Количество' in data_chunks.columns else 0
-    else:
-        engine = create_engine(config['source_db'])
-        with engine.connect() as conn:
-            num_cols = conn.execute(text(f"""
-                SELECT COUNT(*) FROM information_schema.columns
-                WHERE table_name = '{config['table']}'
-            """)).scalar()
-            num_rows = conn.execute(text(f"SELECT COUNT(*) FROM {config['table']}")).scalar()
-            col_types = conn.execute(text(f"""
-                SELECT data_type, COUNT(*) as count
-                FROM information_schema.columns
-                WHERE table_name = '{config['table']}'
-                GROUP BY data_type
-            """)).fetchall()
-            type_dict = {row['data_type']: row['count'] for row in col_types}
-            avg_row_size = conn.execute(text(f"""
-                SELECT AVG(pg_column_size(t.*)) as avg_size
-                FROM {config['table']} t
-                LIMIT 1000
-            """)).scalar() or 0
-            text_cols = type_dict.get("character varying", 0) + type_dict.get("text", 0)
-            numeric_cols = type_dict.get("integer", 0) + type_dict.get("numeric", 0)
-            total_amount = conn.execute(text(f"SELECT SUM(\"Сумма ВТ\") FROM {config['table']}")).scalar() or 0
-            total_quantity = conn.execute(text(f"SELECT SUM(\"Количество\") FROM {config['table']}")).scalar() or 0
+# Валидация миграции
+def validate_migration(config, logger):
+    source_type = config.get('source_type', 'excel')
+    target_type = config.get('target_type', 'excel')
+    
+    try:
+        if source_type == 'excel':
+            src_df = pd.read_excel(config['source_file'], engine='openpyxl')
+        else:
+            engine = create_db_engine(source_type, config['db_params'])
+            src_df = pd.read_sql(f"SELECT * FROM {config['db_params']['table']}", engine)
 
-    return {
-        "num_columns": num_cols,
-        "num_rows": num_rows,
-        "source_engine": config['source_db'].split(":")[0] if 'source_db' in config else "unknown",
-        "target_engine": config['target_db'].split(":")[0] if 'target_db' in config else "unknown",
-        "text_columns": text_cols,
-        "numeric_columns": numeric_cols,
-        "avg_row_size": avg_row_size,
-        "total_amount": total_amount,
-        "total_quantity": total_quantity
-    }
+        if target_type == 'excel':
+            tgt_df = pd.read_excel(config['target_file'], engine='openpyxl')
+        else:
+            engine = create_db_engine(target_type, config['db_params_target'])
+            with engine.connect() as conn:
+                table_exists = engine.dialect.has_table(conn, config['db_params_target']['table'])
+            if not table_exists:
+                logger.warning(f"⚠️ Target table '{config['db_params_target']['table']}' does not exist.")
+                return False
+            tgt_df = pd.read_sql(f"SELECT * FROM {config['db_params_target']['table']}", engine)
 
-# Предобработка данных (потоковый подход)
-def preprocess_data(chunk):
-    chunk = chunk.drop_duplicates()
-    le = LabelEncoder()
-    for col in chunk.select_dtypes(include=['object']).columns:
-        chunk[col] = le.fit_transform(chunk[col].astype(str))
-    return chunk
-
-# Валидация миграции (для больших данных используем выборки)
-def validate_migration(src_engine, tgt_engine, table, logger, sample_size=1000):
-    with src_engine.connect() as src, tgt_engine.connect() as tgt:
-        src_count = src.execute(text(f"SELECT COUNT(*) FROM {table}")).scalar()
-        tgt_count = tgt.execute(text(f"SELECT COUNT(*) FROM {table}")).scalar()
-        logger.info(f"📊 Validation: Source = {src_count}, Target = {tgt_count}")
+        src_count = len(src_df)
+        tgt_count = len(tgt_df)
+        logger.info(f"📊 Validation: Source rows = {src_count}, Target rows = {tgt_count}")
+        
         if src_count != tgt_count:
             logger.warning("⚠️ Row count mismatch.")
             return False
-        src_sample = pd.read_sql(text(f"SELECT * FROM {table} ORDER BY RANDOM() LIMIT {sample_size}"), src)
-        tgt_sample = pd.read_sql(text(f"SELECT * FROM {table} ORDER BY RANDOM() LIMIT {sample_size}"), tgt)
-        if not src_sample.equals(tgt_sample):
-            logger.warning("⚠️ Data integrity mismatch in sampled rows.")
+        
+        src_df = src_df.sort_index(axis=1)
+        tgt_df = tgt_df.sort_index(axis=1)
+        if not src_df.equals(tgt_df):
+            logger.warning("⚠️ Data integrity mismatch.")
             return False
+        
         logger.info("✅ Validation passed: row count and data integrity.")
         return True
+    except Exception as e:
+        logger.error(f"❌ Validation failed: {e}")
+        return False
 
-# Класс миграции (с поддержкой больших данных)
+# Создание SQLAlchemy движка
+def create_db_engine(db_type, db_params):
+    try:
+        if db_type == 'postgresql':
+            connection_string = (
+                f"postgresql+psycopg2://{db_params['user']}:{db_params['password']}@"
+                f"{db_params['host']}:{db_params['port']}/{db_params['database']}"
+            )
+        elif db_type == 'mysql':
+            connection_string = (
+                f"mysql+mysqlconnector://{db_params['user']}:{db_params['password']}@"
+                f"{db_params['host']}:{db_params['port']}/{db_params['database']}"
+            )
+        else:
+            raise ValueError(f"Unsupported database type: {db_type}")
+        return sa.create_engine(connection_string)
+    except Exception as e:
+        raise Exception(f"Failed to create database engine: {e}")
+
+# Класс миграции
 class ETLJob:
-    def __init__(self, config, data_chunks=None, client=None):
+    def __init__(self, config):
         self.config = config
-        self.data_chunks = data_chunks
-        self.src_engine = create_engine(config['source_db'], pool_size=20, max_overflow=0) if self.data_chunks is None else None
-        self.tgt_engine = create_engine(config['target_db'], pool_size=20, max_overflow=0)
-        self.table = config['table']
+        self.source_type = config.get('source_type', 'excel')
+        self.target_type = config.get('target_type', 'excel')
+        self.source_file = config.get('source_file')
+        self.target_file = config.get('target_file')
+        self.db_params = config.get('db_params', {})
+        self.db_params_target = config.get('db_params_target', {})
         self.chunk_size = config['chunk_size']
         self.commit_interval = config['commit_interval']
-        self.parallel_chunks = config.get('parallel_chunks', 1)
-        self.retry_attempts = config.get('retry_attempts', 3)
         self.logger = get_logger()
         self.total_rows = 0
-        self.total_rows_expected = len(data_chunks) if data_chunks is not None else 0
+        self.total_rows_expected = 0  # Определим позже
         self.progress_callback = config.get('progress_callback', None)
         self.duration = 0
-        self.client = client
 
     def stream_data(self):
-        if self.data_chunks is not None:
-            for partition in self.data_chunks.to_delayed():
-                chunk = partition.compute()
-                chunk = preprocess_data(chunk)
+        if self.source_type == 'excel':
+            # Используем openpyxl для чтения Excel построчно
+            workbook = load_workbook(self.source_file, read_only=True)
+            sheet = workbook.active
+
+            # Получаем заголовки
+            headers = [cell.value for cell in next(sheet.rows)]
+            if not headers:
+                raise ValueError("Excel file is empty or has no headers")
+
+            # Подсчитываем общее количество строк для прогресса
+            self.total_rows_expected = sheet.max_row - 1  # Вычитаем строку заголовков
+            self.logger.info(f"Total rows expected: {self.total_rows_expected}")
+
+            # Собираем данные в чанки
+            chunk_data = []
+            for row in sheet.rows:
+                # Пропускаем строку заголовков
+                if row[0].row == 1:
+                    continue
+                row_data = [cell.value for cell in row]
+                chunk_data.append(row_data)
+
+                if len(chunk_data) >= self.chunk_size:
+                    # Создаем DataFrame для текущего чанка
+                    chunk = pd.DataFrame(chunk_data, columns=headers)
+                    yield chunk
+                    chunk_data = []  # Очищаем список для следующего чанка
+                    gc.collect()
+
+            # Обрабатываем оставшиеся строки
+            if chunk_data:
+                chunk = pd.DataFrame(chunk_data, columns=headers)
                 yield chunk
-                # Очистка памяти
+                gc.collect()
+
+            workbook.close()
+        else:
+            # Читаем из базы данных
+            engine = create_db_engine(self.source_type, self.db_params)
+            # Определяем общее количество строк
+            with engine.connect() as conn:
+                result = conn.execute(f"SELECT COUNT(*) FROM {self.db_params['table']}")
+                self.total_rows_expected = result.scalar()
+            self.logger.info(f"Total rows expected: {self.total_rows_expected}")
+
+            query = f"SELECT * FROM {self.db_params['table']}"
+            for chunk in pd.read_sql(query, engine, chunksize=self.chunk_size):
+                yield chunk
                 del chunk
                 gc.collect()
-        else:
-            with self.src_engine.connect().execution_options(stream_results=True) as conn:
-                result = conn.execution_options(yield_per=self.chunk_size).execute(text(f"SELECT * FROM {self.table}"))
-                while True:
-                    chunk = result.fetchmany(self.chunk_size)
-                    if not chunk:
-                        break
-                    df = pd.DataFrame(chunk, columns=result.keys())
-                    yield df
-
-    def _copy_to_postgres(self, df, conn):
-        output = StringIO()
-        df.to_csv(output, sep='\t', header=False, index=False)
-        output.seek(0)
-        cursor = conn.cursor()
-        cursor.copy_from(output, self.table, sep='\t', null='')
-        conn.commit()
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
-    def _migrate_chunk(self, chunk, tgt_conn):
+    def _migrate_chunk_to_db(self, chunk):
         try:
-            with tgt_conn.connect() as conn:
-                self._copy_to_postgres(chunk, conn.raw_connection())
-                rows_migrated.inc(len(chunk))
+            engine = create_db_engine(self.target_type, self.db_params_target)
+            chunk.to_sql(
+                self.db_params_target['table'],
+                engine,
+                if_exists='append',
+                index=False,
+                method='multi'
+            )
+            self.logger.info(f"📝 Migrated {len(chunk)} rows to {self.target_type}")
         except Exception as e:
-            self.logger.error(f"Ошибка миграции чанка: {e}. Повторная попытка...")
+            self.logger.error(f"Ошибка миграции чанка в базу данных: {e}\n{traceback.format_exc()}")
             raise
 
-    def run(self, parallel=False):
-        self.logger.info(f"🚀 Starting ETL job for table '{self.table}'")
-        migrations_total.inc()
+    def run(self):
+        self.logger.info(f"🚀 Starting ETL job: {self.source_type} -> {self.target_type}")
         start = time.time()
-        buffer = []
+        chunk_num = 0
 
         try:
-            with self.tgt_engine.connect() as conn:
-                conn.execute(text(f"CREATE UNLOGGED TABLE IF NOT EXISTS {self.table} (LIKE financial_transactions INCLUDING ALL)"))
-                conn.execute(text(f"DELETE FROM {self.table}"))
-                self.logger.info(f"🧹 Target table '{self.table}' cleared.")
-                conn.execute(text("SET maintenance_work_mem = '1GB'"))
-                conn.execute(text("SET max_parallel_maintenance_workers = 4"))
+            if self.target_type == 'excel':
+                # Потоковая запись в Excel с помощью xlsxwriter
+                workbook = xlsxwriter.Workbook(self.target_file)
+                worksheet = workbook.add_worksheet()
+                first_chunk = True
 
-            with self.tgt_engine.begin() as tgt_conn:
-                chunks = self.stream_data()
-                if parallel and self.client:
-                    tasks = [delayed(self._migrate_chunk)(chunk, self.tgt_engine) for chunk in chunks]
-                    self.client.compute(tasks)
-                    for chunk in chunks:
-                        self.total_rows += len(chunk)
-                        if self.progress_callback and self.total_rows_expected > 0:
-                            self.progress_callback(self.total_rows / self.total_rows_expected * 100)
-                elif parallel:
-                    with ThreadPoolExecutor(max_workers=self.parallel_chunks) as executor:
-                        for chunk in chunks:
-                            buffer.append(chunk)
-                            self.total_rows += len(chunk)
-                            if self.total_rows % self.commit_interval < self.chunk_size:
-                                executor.submit(self._migrate_chunk, pd.concat(buffer), tgt_conn)
-                                if self.progress_callback and self.total_rows_expected > 0:
-                                    self.progress_callback(self.total_rows / self.total_rows_expected * 100)
-                                buffer = []
-                else:
-                    for chunk in chunks:
-                        buffer.append(chunk)
-                        self.total_rows += len(chunk)
-                        if self.total_rows % self.commit_interval < self.chunk_size:
-                            self._copy_to_postgres(pd.concat(buffer), tgt_conn.raw_connection())
-                            if self.progress_callback and self.total_rows_expected > 0:
-                                self.progress_callback(self.total_rows / self.total_rows_expected * 100)
-                            buffer = []
+                for chunk in self.stream_data():
+                    chunk_num += 1
+                    self.logger.info(f"Processing chunk {chunk_num}")
 
-                if buffer:
-                    self._copy_to_postgres(pd.concat(buffer), tgt_conn.raw_connection())
+                    if first_chunk:
+                        # Пишем заголовки
+                        for col_num, col_name in enumerate(chunk.columns):
+                            worksheet.write(0, col_num, col_name)
+                        row = 1
+                        first_chunk = False
+                    else:
+                        row = worksheet.dim_rowmax + 1 if worksheet.dim_rowmax is not None else 1
+
+                    # Пишем данные чанка
+                    for r, row_data in enumerate(chunk.itertuples(index=False), start=row):
+                        for c, value in enumerate(row_data):
+                            worksheet.write(r, c, value)
+
+                    self.total_rows += len(chunk)
                     if self.progress_callback and self.total_rows_expected > 0:
-                        self.progress_callback(self.total_rows / self.total_rows_expected * 100)
+                        progress = (self.total_rows / self.total_rows_expected) * 100
+                        self.logger.info(f"📈 Migration progress: {progress:.2f}%")
+                        self.progress_callback(progress)
+
+                    self.logger.info(f"Chunk {chunk_num} processed")
+                    del chunk
+                    gc.collect()
+
+                workbook.close()
+                self.logger.info(f"📝 Migrated {self.total_rows} rows to {self.target_file}")
+            else:
+                # Для баз данных
+                engine = create_db_engine(self.target_type, self.db_params_target)
+                with engine.connect() as conn:
+                    conn.execute(f"DROP TABLE IF EXISTS {self.db_params_target['table']}")
+                self.logger.info(f"🧹 Target table '{self.db_params_target['table']}' cleared.")
+
+                for chunk in self.stream_data():
+                    chunk_num += 1
+                    self.logger.info(f"Processing chunk {chunk_num}")
+                    self._migrate_chunk_to_db(chunk)
+                    self.total_rows += len(chunk)
+                    if self.progress_callback and self.total_rows_expected > 0:
+                        progress = (self.total_rows / self.total_rows_expected) * 100
+                        self.logger.info(f"📈 Migration progress: {progress:.2f}%")
+                        self.progress_callback(progress)
+                    self.logger.info(f"Chunk {chunk_num} processed")
+                    del chunk
+                    gc.collect()
 
             self.duration = round(time.time() - start, 2)
-            migration_duration.observe(self.duration)
             self.logger.info(f"✅ ETL finished in {self.duration}s, {self.total_rows} rows migrated.")
             
-            with self.tgt_engine.connect() as conn:
-                conn.execute(text(f"ALTER TABLE {self.table} SET LOGGED"))
-                conn.execute(text(f"CREATE INDEX IF NOT EXISTS idx_{self.table}_id ON {self.table} (id)"))
-                self.logger.info(f"📈 Index added on {self.table}.id")
-
-            if self.data_chunks is None:
-                validate_migration(self.src_engine, self.tgt_engine, self.table, self.logger)
+            validate_migration(self.config, self.logger)
 
         except Exception as e:
-            self.logger.error(f"❌ ETL failed: {e}")
+            self.logger.error(f"❌ ETL failed: {e}\n{traceback.format_exc()}")
             raise
-
-# Генетический алгоритм (оптимизирован для больших данных)
-def migrate_once(chunk_size, commit_interval, config, data_chunks=None, client=None):
-    start = time.time()
-    config['chunk_size'] = chunk_size
-    config['commit_interval'] = commit_interval
-    job = ETLJob(config, data_chunks, client)
-    job.run(parallel=True)
-    
-    duration = time.time() - start
-    data_loss = 0
-    total_amount = config.get('features', {}).get('total_amount', 0)
-    fitness = (1.0 / (duration + 1)) * (1 - data_loss) * (1 + total_amount / 1e9)
-    
-    feats = config.get('features', {})
-    result = {
-        "num_columns": feats.get("num_columns", 0),
-        "num_rows": feats.get("num_rows", 0),
-        "source_engine": feats.get("source_engine", ""),
-        "target_engine": feats.get("target_engine", ""),
-        "text_columns": feats.get("text_columns", 0),
-        "numeric_columns": feats.get("numeric_columns", 0),
-        "avg_row_size": feats.get("avg_row_size", 0),
-        "total_amount": feats.get("total_amount", 0),
-        "total_quantity": feats.get("total_quantity", 0),
-        "best_batch": chunk_size,
-        "best_commit": commit_interval,
-        "duration": duration,
-        "data_loss": data_loss,
-    }
-    df = pd.DataFrame([result])
-    os.makedirs("ml_model", exist_ok=True)
-    if os.path.exists("ml_model/dataset.csv"):
-        existing_df = pd.read_csv("ml_model/dataset.csv")
-        if set(existing_df.columns) == set(result.keys()):
-            df.to_csv("ml_model/dataset.csv", mode='a', header=False, index=False)
-        else:
-            print("⚠️ Структура dataset.csv не совпадает, создаём новый файл.")
-            df.to_csv("ml_model/dataset.csv", mode='w', header=True, index=False)
-    else:
-        df.to_csv("ml_model/dataset.csv", mode='w', header=True, index=False)
-    
-    return fitness
-
-def genetic_algorithm(config, data_chunks=None, client=None, pop_size=4, generations=2, initial_params=None):
-    if initial_params:
-        population = [[initial_params[0], initial_params[1]]]
-        population.extend([[random.choice([50000, 100000, 200000]), random.choice([100000, 200000, 500000])] for _ in range(pop_size-1)])
-    else:
-        population = [[random.choice([50000, 100000, 200000]), random.choice([100000, 200000, 500000])] for _ in range(pop_size)]
-    
-    for gen in range(generations):
-        scored = [(migrate_once(p[0], p[1], config, data_chunks, client), p) for p in population]
-        scored.sort(reverse=True)
-        best = scored[0][1]
-        print(f"Gen {gen+1}: best={best}")
-        elites = [p for _, p in scored[:pop_size//2]]
-        children = []
-        while len(children) < pop_size - len(elites):
-            p1, p2 = random.sample(elites, 2)
-            child = [
-                random.choice([p1[0], p2[0]]),
-                int((p1[1] + p2[1]) / 2 + random.randint(-50000, 50000))
-            ]
-            children.append(child)
-        population = elites + children
-    return best
-
-# Обучение ML-модели (с поддержкой больших данных)
-def train_model(data_chunks=None):
-    try:
-        mlflow.set_experiment("etl_migration_optimization")
-    except Exception as e:
-        print(f"⚠️ Не удалось подключиться к MLflow: {e}. Логирование экспериментов отключено.")
-
-    try:
-        df = pd.read_csv("ml_model/dataset.csv")
-    except FileNotFoundError:
-        print("❌ Файл dataset.csv не найден. Создайте его с помощью миграции.")
-        return
-
-    if data_chunks is not None:
-        sample = data_chunks.sample(frac=0.0001).compute()
-        feats = extract_features({}, data_chunks)
-        sample = pd.DataFrame([feats])
-        df = pd.concat([df, sample], ignore_index=True)
-
-    X = df.drop(columns=["best_batch", "best_commit", "duration", "data_loss"])
-    y_batch = df["best_batch"]
-    y_commit = df["best_commit"]
-
-    with mlflow.start_run():
-        model_batch = xgb.XGBRegressor(n_estimators=100, random_state=42)
-        model_commit = xgb.XGBRegressor(n_estimators=100, random_state=42)
-
-        X_train, X_test, yb_train, yb_test = train_test_split(X, y_batch, test_size=0.2, random_state=42)
-        model_batch.fit(X_train, yb_train)
-        batch_mae = mean_absolute_error(yb_test, model_batch.predict(X_test))
-        print("Batch MAE:", batch_mae)
-
-        X_train, X_test, yc_train, yc_test = train_test_split(X, y_commit, test_size=0.2, random_state=42)
-        model_commit.fit(X_train, yc_train)
-        commit_mae = mean_absolute_error(yc_test, model_commit.predict(X_test))
-        print("Commit MAE:", commit_mae)
-
-        mlflow.log_metric("batch_mae", batch_mae)
-        mlflow.log_metric("commit_mae", commit_mae)
-        mlflow.xgboost.log_model(model_batch, "model_batch")
-        mlflow.xgboost.log_model(model_commit, "model_commit")
-
-        os.makedirs("ml_model", exist_ok=True)
-        joblib.dump(model_batch, "ml_model/model_batch.pkl")
-        joblib.dump(model_commit, "ml_model/model_commit.pkl")
 
 # Загрузка конфигурации
 def load_config(path='config.yaml'):
@@ -386,77 +262,99 @@ def load_config(path='config.yaml'):
     return config
 
 # Основная функция миграции
-def run_etl(config, data_chunks=None, parallel=True, client=None):
-    if config.get("optimize", False):
-        feats = extract_features(config, data_chunks)
-        config['features'] = feats
-        feats_df = pd.DataFrame([feats])
-        
-        try:
-            model_batch = joblib.load("ml_model/model_batch.pkl")
-            model_commit = joblib.load("ml_model/model_commit.pkl")
-        except FileNotFoundError:
-            print("❌ Модели не найдены. Запустите 'python etl_project.py train' для их создания.")
-            sys.exit(1)
-        
-        pred_batch = int(model_batch.predict(feats_df)[0])
-        pred_commit = int(model_commit.predict(feats_df)[0])
-        
-        best_params = genetic_algorithm(config, data_chunks, client, initial_params=[pred_batch, pred_commit])
-        config['chunk_size'] = best_params[0]
-        config['commit_interval'] = best_params[1]
-        print(f"🤖 Оптимизированные параметры: batch = {best_params[0]}, commit = {best_params[1]}")
-
-    job = ETLJob(config, data_chunks, client)
-    job.run(parallel=parallel)
+def run_etl(config):
+    job = ETLJob(config)
+    job.run()
     return {"status": "success", "rows_migrated": job.total_rows, "duration": job.duration}
 
-# REST API
-app = FastAPI()
+# Диалог для ввода параметров базы данных
+class DatabaseDialog(tk.Toplevel):
+    def __init__(self, parent, title):
+        super().__init__(parent)
+        self.title(title)
+        self.result = None
+        self.geometry("400x400")
 
-class MigrationRequest(BaseModel):
-    config_path: str = "config.yaml"
-    parallel: bool = True
+        tk.Label(self, text="Host:").pack()
+        self.host_entry = tk.Entry(self)
+        self.host_entry.insert(0, "localhost")
+        self.host_entry.pack()
 
-@app.post("/migrate")
-async def migrate(request: MigrationRequest):
-    try:
-        config = load_config(request.config_path)
-        result = run_etl(config, parallel=request.parallel)
-        return result
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Migration failed: {str(e)}")
+        tk.Label(self, text="Port:").pack()
+        self.port_entry = tk.Entry(self)
+        self.port_entry.insert(0, "5432" if "PostgreSQL" in title else "3306")
+        self.port_entry.pack()
 
-@app.get("/health")
-async def health():
-    return {"status": "healthy"}
+        tk.Label(self, text="Database:").pack()
+        self.db_entry = tk.Entry(self)
+        self.db_entry.pack()
+
+        tk.Label(self, text="User:").pack()
+        self.user_entry = tk.Entry(self)
+        self.user_entry.pack()
+
+        tk.Label(self, text="Password:").pack()
+        self.password_entry = tk.Entry(self, show="*")
+        self.password_entry.pack()
+
+        tk.Label(self, text="Table:").pack()
+        self.table_entry = tk.Entry(self)
+        self.table_entry.pack()
+
+        tk.Button(self, text="OK", command=self.on_ok).pack(pady=10)
+        tk.Button(self, text="Cancel", command=self.on_cancel).pack()
+
+    def on_ok(self):
+        self.result = {
+            "host": self.host_entry.get(),
+            "port": self.port_entry.get(),
+            "database": self.db_entry.get(),
+            "user": self.user_entry.get(),
+            "password": self.password_entry.get(),
+            "table": self.table_entry.get()
+        }
+        self.destroy()
+
+    def on_cancel(self):
+        self.result = None
+        self.destroy()
 
 # Графический интерфейс
 class ETLApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("ETL Migration Tool (Big Data)")
+        self.root.title("ETL Migration Tool")
         self.logger = get_logger()
         self.config = load_config()
-        self.data_chunks = None
-        self.client = None
 
-        # Элементы интерфейса
-        tk.Label(root, text="ETL Migration Tool (Big Data)", font=("Arial", 16)).pack(pady=10)
+        tk.Label(root, text="ETL Migration Tool", font=("Arial", 16)).pack(pady=10)
 
-        # Настройка Dask кластера
-        tk.Button(root, text="Инициализировать Dask кластер", command=self.init_dask).pack(pady=5)
+        tk.Label(root, text="Тип источника:").pack()
+        self.source_type = tk.StringVar(value="excel")
+        source_types = ["excel", "postgresql", "mysql"]
+        self.source_type_menu = ttk.Combobox(root, textvariable=self.source_type, values=source_types, state="readonly")
+        self.source_type_menu.pack()
+        self.source_type_menu.bind("<<ComboboxSelected>>", self.on_source_type_change)
 
-        # Формат данных
-        tk.Label(root, text="Формат данных:").pack()
-        self.file_format = tk.StringVar(value="Excel")
-        tk.Radiobutton(root, text="Excel", variable=self.file_format, value="Excel").pack()
-        tk.Radiobutton(root, text="Parquet", variable=self.file_format, value="Parquet").pack()
+        tk.Label(root, text="Исходный файл или база данных:").pack()
+        self.source_file_entry = tk.Entry(root, width=50)
+        self.source_file_entry.pack()
+        self.source_file_button = tk.Button(root, text="Выбрать исходный файл", command=self.select_source_file)
+        self.source_file_button.pack(pady=5)
 
-        # Загрузка данных
-        tk.Button(root, text="Загрузить данные", command=self.load_data).pack(pady=5)
+        tk.Label(root, text="Тип цели:").pack()
+        self.target_type = tk.StringVar(value="excel")
+        target_types = ["excel", "postgresql", "mysql"]
+        self.target_type_menu = ttk.Combobox(root, textvariable=self.target_type, values=target_types, state="readonly")
+        self.target_type_menu.pack()
+        self.target_type_menu.bind("<<ComboboxSelected>>", self.on_target_type_change)
 
-        # Параметры миграции
+        tk.Label(root, text="Целевой файл или база данных:").pack()
+        self.target_file_entry = tk.Entry(root, width=50)
+        self.target_file_entry.pack()
+        self.target_file_button = tk.Button(root, text="Выбрать целевой файл", command=self.select_target_file)
+        self.target_file_button.pack(pady=5)
+
         tk.Label(root, text="Chunk Size:").pack()
         self.chunk_size_entry = tk.Entry(root)
         self.chunk_size_entry.insert(0, str(self.config.get("chunk_size", 10000)))
@@ -467,90 +365,114 @@ class ETLApp:
         self.commit_interval_entry.insert(0, str(self.config.get("commit_interval", 20000)))
         self.commit_interval_entry.pack()
 
-        # Обучение модели
-        tk.Button(root, text="Обучить модель", command=self.train_model).pack(pady=5)
-
-        # Запуск миграции
         tk.Button(root, text="Запустить миграцию", command=self.run_migration).pack(pady=5)
 
-        # Прогресс
         self.progress = ttk.Progressbar(root, orient="horizontal", length=300, mode="determinate")
         self.progress.pack(pady=10)
 
-        # Логи
         self.log_area = scrolledtext.ScrolledText(root, width=80, height=20)
         self.log_area.pack(pady=10)
 
     def log(self, message):
-        self.log_area.insert(tk.END, message + "\n")
-        self.log_area.yview(tk.END)
+        def update_log():
+            self.log_area.insert(tk.END, message + "\n")
+            self.log_area.yview(tk.END)
+        self.root.after(0, update_log)
         self.logger.info(message)
 
-    def init_dask(self):
-        try:
-            self.client = Client(n_workers=4, threads_per_worker=2)
-            self.log(f"Dask кластер инициализирован: {self.client}")
-        except Exception as e:
-            messagebox.showerror("Ошибка", f"Не удалось инициализировать Dask: {str(e)}")
+    def on_source_type_change(self, event):
+        source_type = self.source_type.get()
+        if source_type == 'excel':
+            self.source_file_button.config(text="Выбрать исходный файл", command=self.select_source_file)
+        else:
+            self.source_file_button.config(text="Выбрать базу данных", command=self.select_source_db)
 
-    def load_data(self):
-        try:
-            if self.file_format.get() == "Excel":
-                self.data_chunks = dd.from_pandas(pd.read_excel("Book1.xlsx", engine='openpyxl'), npartitions=100)
-            else:
-                self.data_chunks = dd.read_parquet("large_financial_data.parquet")
-            self.log(f"Данные загружены (Dask): {len(self.data_chunks)} строк, {len(self.data_chunks.columns)} столбцов.")
-        except Exception as e:
-            messagebox.showerror("Ошибка", f"Не удалось загрузить данные: {str(e)}")
+    def on_target_type_change(self, event):
+        target_type = self.target_type.get()
+        if target_type == 'excel':
+            self.target_file_button.config(text="Выбрать целевой файл", command=self.select_target_file)
+        else:
+            self.target_file_button.config(text="Выбрать базу данных", command=self.select_target_db)
 
-    def train_model(self):
-        threading.Thread(target=self._train_model, daemon=True).start()
+    def select_source_file(self):
+        file_path = filedialog.askopenfilename(
+            title="Выберите исходный файл",
+            filetypes=[("Excel files", "*.xlsx *.xls")]
+        )
+        if file_path:
+            self.source_file_entry.delete(0, tk.END)
+            self.source_file_entry.insert(0, file_path)
+            self.log(f"Выбран исходный файл: {file_path}")
 
-    def _train_model(self):
-        self.log("Начало обучения модели...")
-        self.progress["value"] = 0
-        train_model(self.data_chunks)
-        self.log("Модель обучена.")
-        self.progress["value"] = 100
+    def select_target_file(self):
+        file_path = filedialog.asksaveasfilename(
+            title="Выберите целевой файл",
+            filetypes=[("Excel files", "*.xlsx *.xls")],
+            defaultextension=".xlsx"
+        )
+        if file_path:
+            self.target_file_entry.delete(0, tk.END)
+            self.target_file_entry.insert(0, file_path)
+            self.log(f"Выбран целевой файл: {file_path}")
+
+    def select_source_db(self):
+        dialog = DatabaseDialog(self.root, f"Параметры {self.source_type.get().upper()} источника")
+        self.root.wait_window(dialog)
+        if dialog.result:
+            self.source_file_entry.delete(0, tk.END)
+            self.source_file_entry.insert(0, f"{self.source_type.get()}://{dialog.result['host']}:{dialog.result['port']}/{dialog.result['database']}")
+            self.db_params = dialog.result
+            self.log(f"Выбрана база данных источника: {self.source_file_entry.get()}")
+
+    def select_target_db(self):
+        dialog = DatabaseDialog(self.root, f"Параметры {self.target_type.get().upper()} цели")
+        self.root.wait_window(dialog)
+        if dialog.result:
+            self.target_file_entry.delete(0, tk.END)
+            self.target_file_entry.insert(0, f"{self.source_type.get()}://{dialog.result['host']}:{dialog.result['port']}/{dialog.result['database']}")
+            self.db_params_target = dialog.result
+            self.log(f"Выбрана база данных цели: {self.target_file_entry.get()}")
 
     def run_migration(self):
         threading.Thread(target=self._run_migration, daemon=True).start()
 
     def _run_migration(self):
-        if self.data_chunks is None:
-            messagebox.showwarning("Предупреждение", "Сначала загрузите данные.")
+        source_type = self.source_type.get()
+        target_type = self.target_type.get()
+        source_file = self.source_file_entry.get()
+        target_file = self.target_file_entry.get()
+        if not source_file or not target_file:
+            messagebox.showwarning("Предупреждение", "Выберите исходный и целевой файлы или базы данных.")
             return
         self.log("Запуск миграции...")
         self.progress["value"] = 0
         try:
+            self.config['source_type'] = source_type
+            self.config['target_type'] = target_type
+            self.config['source_file'] = source_file
+            self.config['target_file'] = target_file
+            self.config['db_params'] = getattr(self, 'db_params', {})
+            self.config['db_params_target'] = getattr(self, 'db_params_target', {})
             self.config['chunk_size'] = int(self.chunk_size_entry.get())
             self.config['commit_interval'] = int(self.commit_interval_entry.get())
             def update_progress(value):
-                self.progress["value"] = value
-                self.root.update_idletasks()
+                def update():
+                    self.progress["value"] = value
+                self.root.after(0, update)
 
             self.config['progress_callback'] = update_progress
-            result = run_etl(self.config, self.data_chunks, parallel=True, client=self.client)
+
+            result = run_etl(self.config)
+
             self.log(f"Миграция завершена: {result}")
             self.progress["value"] = 100
+
         except Exception as e:
+            self.log(f"❌ Миграция не удалась: {str(e)}\n{traceback.format_exc()}")
             messagebox.showerror("Ошибка", f"Миграция не удалась: {str(e)}")
 
 # Точка входа
 if __name__ == "__main__":
-    mode = sys.argv[1] if len(sys.argv) > 1 else "gui"
-
-    if mode == "train":
-        train_model()
-    elif mode == "migrate":
-        config = load_config()
-        run_etl(config)
-    elif mode == "api":
-        port = int(os.getenv("API_PORT", 8000))
-        uvicorn.run(app, host="0.0.0.0", port=port)
-    elif mode == "gui":
-        root = tk.Tk()
-        app = ETLApp(root)
-        root.mainloop()
-    else:
-        print("Usage: python etl_project.py [train|migrate|api|gui]")
+    root = tk.Tk()
+    app = ETLApp(root)
+    root.mainloop()

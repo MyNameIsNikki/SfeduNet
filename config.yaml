@@ -1,9 +1,8 @@
-source_db: "postgresql+psycopg2://source_user:source_pass@localhost:5432/source_db"
-target_db: "postgresql+psycopg2://target_user:target_pass@localhost:5432/target_db"
-table: "financial_transactions"
-chunk_size: 100000
-commit_interval: 200000
+source_file: "Book1.xlsx"
+target_file: "Book2.xlsx"
+chunk_size: 10000
+commit_interval: 20000
 retry_attempts: 3
 optimize: true
-parallel_chunks: 8
+parallel_chunks: 4
 api_port: 8000
