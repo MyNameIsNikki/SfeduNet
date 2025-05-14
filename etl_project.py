@@ -9,12 +9,13 @@ import sqlalchemy as sa
 import psycopg2
 import mysql.connector
 import traceback
+import itertools
 import xlsxwriter
+from openpyxl import load_workbook, Workbook
 import tkinter as tk
 from tkinter import ttk, scrolledtext, messagebox, filedialog
 import threading
 from tenacity import retry, stop_after_attempt, wait_exponential
-from openpyxl import load_workbook
 
 # Логирование
 def get_logger():
@@ -55,13 +56,13 @@ def validate_migration(config, logger):
         logger.info(f"📊 Validation: Source rows = {src_count}, Target rows = {tgt_count}")
         
         if src_count != tgt_count:
-            logger.warning("⚠️ Row count mismatch.")
+            logger.warning(f"⚠️ Row count mismatch: Source={src_count}, Target={tgt_count}")
             return False
         
         src_df = src_df.sort_index(axis=1)
         tgt_df = tgt_df.sort_index(axis=1)
         if not src_df.equals(tgt_df):
-            logger.warning("⚠️ Data integrity mismatch.")
+            logger.warning("⚠️ Data integrity mismatch. Columns or values differ.")
             return False
         
         logger.info("✅ Validation passed: row count and data integrity.")
@@ -70,7 +71,7 @@ def validate_migration(config, logger):
         logger.error(f"❌ Validation failed: {e}")
         return False
 
-# Создание SQLAlchemy движка
+# Создание SQLAlchemy движка с проверкой подключения
 def create_db_engine(db_type, db_params):
     try:
         if db_type == 'postgresql':
@@ -85,7 +86,10 @@ def create_db_engine(db_type, db_params):
             )
         else:
             raise ValueError(f"Unsupported database type: {db_type}")
-        return sa.create_engine(connection_string)
+        engine = sa.create_engine(connection_string)
+        with engine.connect() as conn:
+            conn.execute("SELECT 1")  # Проверка подключения
+        return engine
     except Exception as e:
         raise Exception(f"Failed to create database engine: {e}")
 
@@ -99,79 +103,147 @@ class ETLJob:
         self.target_file = config.get('target_file')
         self.db_params = config.get('db_params', {})
         self.db_params_target = config.get('db_params_target', {})
-        self.chunk_size = config['chunk_size']
-        self.commit_interval = config['commit_interval']
+        self.chunk_size = min(config.get('chunk_size', 10000), 50000)  # Ограничение максимального чанка
+        self.commit_interval = config.get('commit_interval', 20000)
         self.logger = get_logger()
         self.total_rows = 0
-        self.total_rows_expected = 0  # Определим позже
+        self.total_rows_expected = 0
         self.progress_callback = config.get('progress_callback', None)
         self.duration = 0
 
     def stream_data(self):
         if self.source_type == 'excel':
-            # Используем openpyxl для чтения Excel построчно
+            if not os.path.exists(self.source_file):
+                raise FileNotFoundError(f"Source file {self.source_file} does not exist.")
+            if not os.access(self.source_file, os.R_OK):
+                raise PermissionError(f"No read permission for {self.source_file}")
             workbook = load_workbook(self.source_file, read_only=True)
             sheet = workbook.active
 
-            # Получаем заголовки
             headers = [cell.value for cell in next(sheet.rows)]
             if not headers:
                 raise ValueError("Excel file is empty or has no headers")
 
-            # Подсчитываем общее количество строк для прогресса
-            self.total_rows_expected = sheet.max_row - 1  # Вычитаем строку заголовков
+            self.total_rows_expected = sheet.max_row - 1
             self.logger.info(f"Total rows expected: {self.total_rows_expected}")
 
-            # Собираем данные в чанки
             chunk_data = []
             for row in sheet.rows:
-                # Пропускаем строку заголовков
                 if row[0].row == 1:
                     continue
                 row_data = [cell.value for cell in row]
                 chunk_data.append(row_data)
 
                 if len(chunk_data) >= self.chunk_size:
-                    # Создаем DataFrame для текущего чанка
                     chunk = pd.DataFrame(chunk_data, columns=headers)
                     yield chunk
-                    chunk_data = []  # Очищаем список для следующего чанка
-                    gc.collect()
+                    chunk_data = []
 
-            # Обрабатываем оставшиеся строки
             if chunk_data:
                 chunk = pd.DataFrame(chunk_data, columns=headers)
                 yield chunk
-                gc.collect()
 
             workbook.close()
-        else:
-            # Читаем из базы данных
-            engine = create_db_engine(self.source_type, self.db_params)
-            # Определяем общее количество строк
-            with engine.connect() as conn:
-                result = conn.execute(f"SELECT COUNT(*) FROM {self.db_params['table']}")
-                self.total_rows_expected = result.scalar()
-            self.logger.info(f"Total rows expected: {self.total_rows_expected}")
+        elif self.source_type in ['postgresql', 'mysql']:
+            try:
+                engine = create_db_engine(self.source_type, self.db_params)
+                with engine.connect() as conn:
+                    result = conn.execute(f"SELECT COUNT(*) FROM {self.db_params['table']}")
+                    self.total_rows_expected = result.fetchone()[0]
+                self.logger.info(f"Total rows expected: {self.total_rows_expected}")
 
-            query = f"SELECT * FROM {self.db_params['table']}"
-            for chunk in pd.read_sql(query, engine, chunksize=self.chunk_size):
-                yield chunk
-                del chunk
-                gc.collect()
+                conn = psycopg2.connect(**self.db_params) if self.source_type == 'postgresql' else mysql.connector.connect(**self.db_params)
+                cursor = conn.cursor(name='etl_cursor' if self.source_type == 'postgresql' else None, buffered=False)
+                cursor.execute(f"SELECT * FROM {self.db_params['table']}")
+                headers = [desc[0] for desc in cursor.description]
+                chunk_data = []
+
+                while True:
+                    rows = cursor.fetchmany(self.chunk_size)
+                    if not rows:
+                        break
+                    chunk_data.extend(rows)
+                    if len(chunk_data) >= self.chunk_size:
+                        chunk = pd.DataFrame(chunk_data, columns=headers)
+                        yield chunk
+                        chunk_data = []
+
+                if chunk_data:
+                    chunk = pd.DataFrame(chunk_data, columns=headers)
+                    yield chunk
+
+                cursor.close()
+                conn.close()
+            except Exception as e:
+                raise Exception(f"Database connection error: {e}")
+        else:
+            raise ValueError(f"Unsupported source type: {self.source_type}")
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
     def _migrate_chunk_to_db(self, chunk):
         try:
-            engine = create_db_engine(self.target_type, self.db_params_target)
-            chunk.to_sql(
-                self.db_params_target['table'],
-                engine,
-                if_exists='append',
-                index=False,
-                method='multi'
-            )
-            self.logger.info(f"📝 Migrated {len(chunk)} rows to {self.target_type}")
+            if self.target_type == 'postgresql':
+                conn = psycopg2.connect(
+                    host=self.db_params_target['host'],
+                    port=self.db_params_target['port'],
+                    database=self.db_params_target['database'],
+                    user=self.db_params_target['user'],
+                    password=self.db_params_target['password']
+                )
+                cursor = conn.cursor()
+                temp_csv = f"temp_chunk_{os.getpid()}.csv"
+                chunk.to_csv(temp_csv, index=False, header=False, na_rep='\\N')
+
+                columns = ",".join(chunk.columns)
+                with open(temp_csv, 'r') as f:
+                    cursor.copy_from(f, self.db_params_target['table'], sep=',', columns=chunk.columns, null='\\N')
+                conn.commit()
+
+                os.remove(temp_csv)
+                cursor.close()
+                conn.close()
+            elif self.target_type == 'mysql':
+                conn = mysql.connector.connect(
+                    host=self.db_params_target['host'],
+                    port=self.db_params_target['port'],
+                    database=self.db_params_target['database'],
+                    user=self.db_params_target['user'],
+                    password=self.db_params_target['password']
+                )
+                cursor = conn.cursor()
+
+                cursor.execute("SHOW VARIABLES LIKE 'local_infile'")
+                local_infile = cursor.fetchone()
+                if local_infile[1] != 'ON':
+                    engine = create_db_engine(self.target_type, self.db_params_target)
+                    chunk.to_sql(
+                        self.db_params_target['table'],
+                        engine,
+                        if_exists='append',
+                        index=False,
+                        method='multi'
+                    )
+                else:
+                    temp_csv = f"temp_chunk_{os.getpid()}.csv"
+                    chunk.to_csv(temp_csv, index=False, header=False, na_rep='\\N')
+
+                    columns = ",".join(chunk.columns)
+                    cursor.execute(f"""
+                        LOAD DATA LOCAL INFILE '{temp_csv}'
+                        INTO TABLE {self.db_params_target['table']}
+                        FIELDS TERMINATED BY ','
+                        ENCLOSED BY '"'
+                        LINES TERMINATED BY '\n'
+                        ({columns})
+                    """)
+                    conn.commit()
+                    os.remove(temp_csv)
+
+                cursor.close()
+                conn.close()
+            else:
+                raise ValueError(f"Unsupported target type: {self.target_type}")
+
         except Exception as e:
             self.logger.error(f"Ошибка миграции чанка в базу данных: {e}\n{traceback.format_exc()}")
             raise
@@ -182,61 +254,147 @@ class ETLJob:
         chunk_num = 0
 
         try:
+            # Проверка целевого файла
+            if self.target_type == 'excel' and os.path.exists(self.target_file):
+                workbook = load_workbook(self.target_file)
+                worksheet = workbook.active
+                headers_exist = any(worksheet.cell(row=1, column=col).value for col in range(1, worksheet.max_column + 1))
+                if headers_exist or worksheet.max_row > 1:
+                    workbook.close()
+                    response = messagebox.askyesnocancel(
+                        "Предупреждение",
+                        f"Целевой файл {self.target_file} уже содержит данные. Перезаписать? (Да - перезаписать, Нет - добавить, Отмена - отменить)"
+                    )
+                    if response is None:  # Отмена
+                        self.logger.warning("Migration cancelled by user.")
+                        return
+                    elif not response:  # Нет - добавить
+                        row = worksheet.max_row + 1 if worksheet.max_row is not None else 2
+                    else:  # Да - перезаписать
+                        row = 1
+                else:
+                    row = 1
+                workbook.close()
+            else:
+                row = 1
+
             if self.target_type == 'excel':
-                # Потоковая запись в Excel с помощью xlsxwriter
+                # Используем xlsxwriter для потоковой записи
                 workbook = xlsxwriter.Workbook(self.target_file)
                 worksheet = workbook.add_worksheet()
-                first_chunk = True
 
-                for chunk in self.stream_data():
-                    chunk_num += 1
-                    self.logger.info(f"Processing chunk {chunk_num}")
+                # Получаем заголовки из источника
+                if self.source_type == 'excel':
+                    if not os.path.exists(self.source_file):
+                        raise FileNotFoundError(f"Source file {self.source_file} does not exist.")
+                    if not os.access(self.source_file, os.R_OK):
+                        raise PermissionError(f"No read permission for {self.source_file}")
+                    workbook_source = load_workbook(self.source_file, read_only=True)
+                    sheet_source = workbook_source.active
+                    headers = [cell.value for cell in next(sheet_source.rows)]
+                    if not headers:
+                        raise ValueError("Excel file is empty or has no headers")
+                    self.total_rows_expected = sheet_source.max_row - 1
+                    self.logger.info(f"Total rows expected: {self.total_rows_expected}")
+                else:
+                    stream = self.stream_data()
+                    first_chunk = next(stream, None)
+                    if first_chunk is None:
+                        self.logger.warning("No data to migrate.")
+                        workbook.close()
+                        return
+                    headers = list(first_chunk.columns)
+                    stream = itertools.chain([first_chunk], stream)
 
-                    if first_chunk:
-                        # Пишем заголовки
-                        for col_num, col_name in enumerate(chunk.columns):
-                            worksheet.write(0, col_num, col_name)
-                        row = 1
-                        first_chunk = False
-                    else:
-                        row = worksheet.dim_rowmax + 1 if worksheet.dim_rowmax is not None else 1
+                # Записываем заголовки, если их нет
+                if row == 1:
+                    for col_num, col_name in enumerate(headers):
+                        worksheet.write(0, col_num, str(col_name) if col_name is not None else "")
+                    row = 1
+                else:
+                    row = max(row - 1, 1)  # Учитываем, что строка уже занята заголовками
 
-                    # Пишем данные чанка
-                    for r, row_data in enumerate(chunk.itertuples(index=False), start=row):
-                        for c, value in enumerate(row_data):
-                            worksheet.write(r, c, value)
+                # Потоковая запись в Excel
+                if self.source_type == 'excel':
+                    chunk_data = []
+                    for src_row in sheet_source.rows:
+                        if src_row[0].row == 1:
+                            continue
+                        row_data = [cell.value for cell in src_row]
+                        chunk_data.append(row_data)
 
-                    self.total_rows += len(chunk)
-                    if self.progress_callback and self.total_rows_expected > 0:
-                        progress = (self.total_rows / self.total_rows_expected) * 100
-                        self.logger.info(f"📈 Migration progress: {progress:.2f}%")
-                        self.progress_callback(progress)
+                        if len(chunk_data) >= self.chunk_size:
+                            for r, data_row in enumerate(chunk_data, start=row):
+                                safe_row = [str(val) if val is not None else "" for val in data_row]
+                                worksheet.write_row(r, 0, safe_row)
+                            row += len(chunk_data)
+                            self.total_rows += len(chunk_data)
 
-                    self.logger.info(f"Chunk {chunk_num} processed")
-                    del chunk
-                    gc.collect()
+                            if self.progress_callback and self.total_rows_expected > 0:
+                                progress = (self.total_rows / self.total_rows_expected) * 100
+                                self.progress_callback(progress)
+
+                            chunk_num += 1
+                            chunk_data = []
+
+                    # Обрабатываем оставшиеся строки
+                    if chunk_data:
+                        for r, data_row in enumerate(chunk_data, start=row):
+                            safe_row = [str(val) if val is not None else "" for val in data_row]
+                            worksheet.write_row(r, 0, safe_row)
+                        self.total_rows += len(chunk_data)
+
+                        if self.progress_callback and self.total_rows_expected > 0:
+                            progress = (self.total_rows / self.total_rows_expected) * 100
+                            self.progress_callback(progress)
+
+                        chunk_num += 1
+
+                    workbook_source.close()
+                else:
+                    # Источник — база данных
+                    for chunk in stream:
+                        chunk_num += 1
+                        for r, row_data in enumerate(chunk.values, start=row):
+                            safe_row = [str(val) if pd.notna(val) else "" for val in row_data]
+                            worksheet.write_row(r, 0, safe_row)
+                        row += len(chunk)
+                        self.total_rows += len(chunk)
+
+                        if self.progress_callback and self.total_rows_expected > 0:
+                            progress = (self.total_rows / self.total_rows_expected) * 100
+                            self.progress_callback(progress)
 
                 workbook.close()
                 self.logger.info(f"📝 Migrated {self.total_rows} rows to {self.target_file}")
             else:
                 # Для баз данных
+                stream = self.stream_data()
+                first_chunk = next(stream, None)
+                if first_chunk is None:
+                    self.logger.warning("No data to migrate.")
+                    return
+
                 engine = create_db_engine(self.target_type, self.db_params_target)
                 with engine.connect() as conn:
                     conn.execute(f"DROP TABLE IF EXISTS {self.db_params_target['table']}")
                 self.logger.info(f"🧹 Target table '{self.db_params_target['table']}' cleared.")
+                first_chunk.to_sql(self.db_params_target['table'], engine, if_exists='replace', index=False)
 
-                for chunk in self.stream_data():
+                self.total_rows += len(first_chunk)
+                if self.progress_callback and self.total_rows_expected > 0:
+                    progress = (self.total_rows / self.total_rows_expected) * 100
+                    self.progress_callback(progress)
+
+                chunk_num += 1
+
+                for chunk in stream:
                     chunk_num += 1
-                    self.logger.info(f"Processing chunk {chunk_num}")
                     self._migrate_chunk_to_db(chunk)
                     self.total_rows += len(chunk)
                     if self.progress_callback and self.total_rows_expected > 0:
                         progress = (self.total_rows / self.total_rows_expected) * 100
-                        self.logger.info(f"📈 Migration progress: {progress:.2f}%")
                         self.progress_callback(progress)
-                    self.logger.info(f"Chunk {chunk_num} processed")
-                    del chunk
-                    gc.collect()
 
             self.duration = round(time.time() - start, 2)
             self.logger.info(f"✅ ETL finished in {self.duration}s, {self.total_rows} rows migrated.")
@@ -250,10 +408,13 @@ class ETLJob:
 # Загрузка конфигурации
 def load_config(path='config.yaml'):
     try:
-        with open(path, 'r') as f:
+        with open(path, 'r', encoding='utf-8') as f:
             config = yaml.safe_load(f)
     except FileNotFoundError:
         print(f"❌ Файл конфигурации {path} не найден.")
+        sys.exit(1)
+    except UnicodeDecodeError:
+        print(f"❌ Файл конфигурации {path} имеет некорректную кодировку. Попробуйте сохранить его в UTF-8.")
         sys.exit(1)
     
     for key in config:
@@ -400,6 +561,12 @@ class ETLApp:
             filetypes=[("Excel files", "*.xlsx *.xls")]
         )
         if file_path:
+            if not os.path.exists(file_path):
+                messagebox.showerror("Ошибка", f"Файл {file_path} не существует.")
+                return
+            if not os.access(file_path, os.R_OK):
+                messagebox.showerror("Ошибка", f"Нет прав на чтение файла {file_path}.")
+                return
             self.source_file_entry.delete(0, tk.END)
             self.source_file_entry.insert(0, file_path)
             self.log(f"Выбран исходный файл: {file_path}")
@@ -411,6 +578,10 @@ class ETLApp:
             defaultextension=".xlsx"
         )
         if file_path:
+            if os.path.exists(file_path):
+                if not os.access(file_path, os.W_OK):
+                    messagebox.showerror("Ошибка", f"Нет прав на запись в файл {file_path}.")
+                    return
             self.target_file_entry.delete(0, tk.END)
             self.target_file_entry.insert(0, file_path)
             self.log(f"Выбран целевой файл: {file_path}")
@@ -429,7 +600,7 @@ class ETLApp:
         self.root.wait_window(dialog)
         if dialog.result:
             self.target_file_entry.delete(0, tk.END)
-            self.target_file_entry.insert(0, f"{self.source_type.get()}://{dialog.result['host']}:{dialog.result['port']}/{dialog.result['database']}")
+            self.target_file_entry.insert(0, f"{self.target_type.get()}://{dialog.result['host']}:{dialog.result['port']}/{dialog.result['database']}")
             self.db_params_target = dialog.result
             self.log(f"Выбрана база данных цели: {self.target_file_entry.get()}")
 
