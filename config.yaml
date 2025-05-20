@@ -1,8 +1,19 @@
-source_file: "Book1.xlsx"
-target_file: "Book2.xlsx"
 chunk_size: 10000
 commit_interval: 20000
-retry_attempts: 3
-optimize: true
-parallel_chunks: 4
-api_port: 8000
+ga_pop_size: 20
+ga_generations: 10
+ga_weights: [10, 2, 2, 2, 0.5, 0.5]
+db_params:
+  host: localhost
+  port: 5432
+  database: mydb
+  user: postgres
+  password: password
+  table: mytable
+db_params_target:
+  host: localhost
+  port: 5432
+  database: targetdb
+  user: postgres
+  password: password
+  table: targettable

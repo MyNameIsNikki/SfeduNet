@@ -16,13 +16,18 @@ import tkinter as tk
 from tkinter import ttk, scrolledtext, messagebox, filedialog
 import threading
 from tenacity import retry, stop_after_attempt, wait_exponential
+import pickle
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import mean_squared_error
+import psutil
 
-# Логирование
+# Логирование с поддержкой UTF-8
 def get_logger():
     logger = logging.getLogger("ETL")
     logger.setLevel(logging.INFO)
     os.makedirs("logs", exist_ok=True)
-    fh = logging.FileHandler("logs/etl.log")
+    fh = logging.FileHandler("logs/etl.log", encoding='utf-8')
     formatter = logging.Formatter("%(asctime)s — %(levelname)s — %(message)s")
     fh.setFormatter(formatter)
     logger.addHandler(fh)
@@ -93,7 +98,7 @@ def create_db_engine(db_type, db_params):
     except Exception as e:
         raise Exception(f"Failed to create database engine: {e}")
 
-# Класс миграции
+# Класс миграции с обучением
 class ETLJob:
     def __init__(self, config):
         self.config = config
@@ -105,11 +110,106 @@ class ETLJob:
         self.db_params_target = config.get('db_params_target', {})
         self.chunk_size = min(config.get('chunk_size', 10000), 50000)  # Ограничение максимального чанка
         self.commit_interval = config.get('commit_interval', 20000)
+        self.ga_pop_size = config.get('ga_pop_size', 20)
+        self.ga_generations = config.get('ga_generations', 10)
+        self.ga_weights = config.get('ga_weights', [10, 2, 2, 2, 0.5, 0.5])
         self.logger = get_logger()
         self.total_rows = 0
         self.total_rows_expected = 0
         self.progress_callback = config.get('progress_callback', None)
         self.duration = 0
+        self.predicted_duration = 0
+
+        # Инициализация модели и данных
+        self.model_file = "etl_optimizer.pkl"
+        self.data_file = "migration_logs.csv"
+        self.model = self._load_or_init_model()
+        self._ensure_data_file()
+
+    def _load_or_init_model(self):
+        # Загружаем модель или создаём новую, если её нет
+        if os.path.exists(self.model_file):
+            with open(self.model_file, "rb") as f:
+                return pickle.load(f)
+        return RandomForestRegressor(n_estimators=100, random_state=42)
+
+    def _ensure_data_file(self):
+        # Создаём файл данных, если его нет
+        if not os.path.exists(self.data_file):
+            pd.DataFrame(columns=["file_size", "num_columns", "memory_available", "chunk_size", "commit_interval", "duration"]).to_csv(self.data_file, index=False)
+
+    def _predict_parameters_and_duration(self):
+        # Собираем данные для предсказания
+        if self.source_type == 'excel':
+            workbook = load_workbook(self.source_file, read_only=True)
+            sheet = workbook.active
+            num_rows = sheet.max_row - 1
+            num_columns = len([cell.value for cell in next(sheet.rows) if cell.value])
+            workbook.close()
+        else:
+            engine = create_db_engine(self.source_type, self.db_params)
+            with engine.connect() as conn:
+                result = conn.execute(f"SELECT COUNT(*) FROM {self.db_params['table']}")
+                num_rows = result.fetchone()[0]
+                result = conn.execute(f"SELECT * FROM {self.db_params['table']} LIMIT 1")
+                num_columns = len(result.keys())
+
+        memory_available = psutil.virtual_memory().available // (1024 * 1024)  # В МБ
+
+        input_data = pd.DataFrame({
+            "file_size": [num_rows],
+            "num_columns": [num_columns],
+            "memory_available": [memory_available]
+        })
+
+        # Проверяем, обучена ли модель, и используем предсказание или значения по умолчанию
+        try:
+            predicted = self.model.predict(input_data)[0]
+            self.chunk_size = max(100, int(predicted[0]))  # Минимальный размер чанка
+            self.commit_interval = max(1000, int(predicted[1]))  # Минимальный интервал
+            self.predicted_duration = max(1, int(predicted[2]))  # Предсказанная длительность
+        except Exception as e:
+            self.logger.warning(f"Model not fitted, using default values: {e}")
+            self.chunk_size = min(self.config.get('chunk_size', 10000), 50000)
+            self.commit_interval = self.config.get('commit_interval', 20000)
+            self.predicted_duration = max(1, int(num_rows / 1000))  # Простая оценка длительности
+
+        self.logger.info(f"Predicted parameters: chunk_size={self.chunk_size}, commit_interval={self.commit_interval}, duration={self.predicted_duration}s")
+
+    def _log_migration_data(self):
+        # Логируем данные миграции
+        data = pd.read_csv(self.data_file)
+        new_row = pd.DataFrame({
+            "file_size": [self.total_rows_expected],
+            "num_columns": [len(self.stream_data().__next__().columns) if self.total_rows_expected > 0 else 0],
+            "memory_available": [psutil.virtual_memory().available // (1024 * 1024)],
+            "chunk_size": [self.chunk_size],
+            "commit_interval": [self.commit_interval],
+            "duration": [self.duration]
+        })
+        data = pd.concat([data, new_row], ignore_index=True)
+        data.to_csv(self.data_file, index=False)
+        self.logger.info(f"Logged migration data.")
+
+    def _train_model(self):
+        # Обучаем модель на основе собранных данных
+        data = pd.read_csv(self.data_file)
+        if len(data) < 10:  # Минимальное количество записей для обучения
+            self.logger.warning("Not enough data for training. Need at least 10 records.")
+            return
+
+        X = data[["file_size", "num_columns", "memory_available"]]
+        y = data[["chunk_size", "commit_interval", "duration"]]
+        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+        self.model.fit(X_train, y_train)
+        y_pred = self.model.predict(X_test)
+        mse = mean_squared_error(y_test, y_pred)
+        self.logger.info(f"Model retrained. Mean Squared Error: {mse}")
+
+        with open(self.model_file, "wb") as f:
+            pickle.dump(self.model, f)
+        self.logger.info(f"Model saved.")
 
     def stream_data(self):
         if self.source_type == 'excel':
@@ -249,6 +349,7 @@ class ETLJob:
             raise
 
     def run(self):
+        self._predict_parameters_and_duration()  # Предсказываем параметры и длительность
         self.logger.info(f"🚀 Starting ETL job: {self.source_type} -> {self.target_type}")
         start = time.time()
         chunk_num = 0
@@ -399,13 +500,16 @@ class ETLJob:
             self.duration = round(time.time() - start, 2)
             self.logger.info(f"✅ ETL finished in {self.duration}s, {self.total_rows} rows migrated.")
             
+            self._log_migration_data()  # Логируем данные после миграции
+            self._train_model()  # Обучаем модель после каждой миграции
+
             validate_migration(self.config, self.logger)
 
         except Exception as e:
             self.logger.error(f"❌ ETL failed: {e}\n{traceback.format_exc()}")
             raise
 
-# Загрузка конфигурации
+# Загрузка конфигурации без изменений
 def load_config(path='config.yaml'):
     try:
         with open(path, 'r', encoding='utf-8') as f:
@@ -430,10 +534,11 @@ def run_etl(config):
 
 # Диалог для ввода параметров базы данных
 class DatabaseDialog(tk.Toplevel):
-    def __init__(self, parent, title):
+    def __init__(self, parent, title, db_type):
         super().__init__(parent)
         self.title(title)
         self.result = None
+        self.db_type = db_type
         self.geometry("400x400")
 
         tk.Label(self, text="Host:").pack()
@@ -443,7 +548,7 @@ class DatabaseDialog(tk.Toplevel):
 
         tk.Label(self, text="Port:").pack()
         self.port_entry = tk.Entry(self)
-        self.port_entry.insert(0, "5432" if "PostgreSQL" in title else "3306")
+        self.port_entry.insert(0, "5432" if "postgresql" in db_type.lower() else "3306")
         self.port_entry.pack()
 
         tk.Label(self, text="Database:").pack()
@@ -487,6 +592,8 @@ class ETLApp:
         self.root.title("ETL Migration Tool")
         self.logger = get_logger()
         self.config = load_config()
+        self.source_db_params = None
+        self.target_db_params = None
 
         tk.Label(root, text="ETL Migration Tool", font=("Arial", 16)).pack(pady=10)
 
@@ -516,6 +623,8 @@ class ETLApp:
         self.target_file_button = tk.Button(root, text="Выбрать целевой файл", command=self.select_target_file)
         self.target_file_button.pack(pady=5)
 
+        tk.Button(root, text="Настроить подключение к БД", command=self.open_db_config_dialog).pack(pady=5)
+
         tk.Label(root, text="Chunk Size:").pack()
         self.chunk_size_entry = tk.Entry(root)
         self.chunk_size_entry.insert(0, str(self.config.get("chunk_size", 10000)))
@@ -526,7 +635,11 @@ class ETLApp:
         self.commit_interval_entry.insert(0, str(self.config.get("commit_interval", 20000)))
         self.commit_interval_entry.pack()
 
+        self.predicted_time_label = tk.Label(root, text="Предполагаемое время: -")
+        self.predicted_time_label.pack(pady=5)
+
         tk.Button(root, text="Запустить миграцию", command=self.run_migration).pack(pady=5)
+        tk.Button(root, text="Обучить модель", command=self.train_model).pack(pady=5)
 
         self.progress = ttk.Progressbar(root, orient="horizontal", length=300, mode="determinate")
         self.progress.pack(pady=10)
@@ -587,25 +700,78 @@ class ETLApp:
             self.log(f"Выбран целевой файл: {file_path}")
 
     def select_source_db(self):
-        dialog = DatabaseDialog(self.root, f"Параметры {self.source_type.get().upper()} источника")
+        dialog = DatabaseDialog(self.root, f"Параметры {self.source_type.get().upper()} источника", self.source_type.get())
         self.root.wait_window(dialog)
         if dialog.result:
             self.source_file_entry.delete(0, tk.END)
             self.source_file_entry.insert(0, f"{self.source_type.get()}://{dialog.result['host']}:{dialog.result['port']}/{dialog.result['database']}")
-            self.db_params = dialog.result
+            self.source_db_params = dialog.result
             self.log(f"Выбрана база данных источника: {self.source_file_entry.get()}")
 
     def select_target_db(self):
-        dialog = DatabaseDialog(self.root, f"Параметры {self.target_type.get().upper()} цели")
+        dialog = DatabaseDialog(self.root, f"Параметры {self.target_type.get().upper()} цели", self.target_type.get())
         self.root.wait_window(dialog)
         if dialog.result:
             self.target_file_entry.delete(0, tk.END)
             self.target_file_entry.insert(0, f"{self.target_type.get()}://{dialog.result['host']}:{dialog.result['port']}/{dialog.result['database']}")
-            self.db_params_target = dialog.result
+            self.target_db_params = dialog.result
             self.log(f"Выбрана база данных цели: {self.target_file_entry.get()}")
+
+    def open_db_config_dialog(self):
+        # Диалоговое окно для настройки подключения к БД
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Настройка подключения к БД")
+        dialog.geometry("600x400")
+
+        # Вкладки для источника и цели
+        notebook = ttk.Notebook(dialog)
+        notebook.pack(fill="both", expand=True)
+
+        # Вкладка для источника
+        source_frame = ttk.Frame(notebook)
+        notebook.add(source_frame, text="Источник")
+        tk.Label(source_frame, text=f"Параметры источника ({self.source_type.get().upper()}):").pack(pady=5)
+        source_dialog = DatabaseDialog(source_frame, "Источник", self.source_type.get())
+        source_dialog.pack(fill="both", expand=True)
+
+        # Вкладка для цели
+        target_frame = ttk.Frame(notebook)
+        notebook.add(target_frame, text="Цель")
+        tk.Label(target_frame, text=f"Параметры цели ({self.target_type.get().upper()}):").pack(pady=5)
+        target_dialog = DatabaseDialog(target_frame, "Цель", self.target_type.get())
+        target_dialog.pack(fill="both", expand=True)
+
+        def save_db_config():
+            self.source_db_params = source_dialog.result
+            self.target_db_params = target_dialog.result
+            if self.source_db_params:
+                self.source_file_entry.delete(0, tk.END)
+                self.source_file_entry.insert(0, f"{self.source_type.get()}://{self.source_db_params['host']}:{self.source_db_params['port']}/{self.source_db_params['database']}")
+                self.log(f"Настроены параметры источника: {self.source_file_entry.get()}")
+            if self.target_db_params:
+                self.target_file_entry.delete(0, tk.END)
+                self.target_file_entry.insert(0, f"{self.target_type.get()}://{self.target_db_params['host']}:{self.target_db_params['port']}/{self.target_db_params['database']}")
+                self.log(f"Настроены параметры цели: {self.target_file_entry.get()}")
+            dialog.destroy()
+
+        tk.Button(dialog, text="Сохранить", command=save_db_config).pack(pady=10)
+        tk.Button(dialog, text="Отмена", command=dialog.destroy).pack()
 
     def run_migration(self):
         threading.Thread(target=self._run_migration, daemon=True).start()
+
+    def train_model(self):
+        threading.Thread(target=self._train_model_thread, daemon=True).start()
+
+    def _train_model_thread(self):
+        self.log("Запуск обучения модели...")
+        try:
+            job = ETLJob(self.config)
+            job._train_model()
+            self.log("Обучение модели завершено.")
+        except Exception as e:
+            self.log(f"❌ Ошибка обучения модели: {str(e)}\n{traceback.format_exc()}")
+            messagebox.showerror("Ошибка", f"Ошибка обучения модели: {str(e)}")
 
     def _run_migration(self):
         source_type = self.source_type.get()
@@ -618,25 +784,36 @@ class ETLApp:
         self.log("Запуск миграции...")
         self.progress["value"] = 0
         try:
-            self.config['source_type'] = source_type
-            self.config['target_type'] = target_type
-            self.config['source_file'] = source_file
-            self.config['target_file'] = target_file
-            self.config['db_params'] = getattr(self, 'db_params', {})
-            self.config['db_params_target'] = getattr(self, 'db_params_target', {})
-            self.config['chunk_size'] = int(self.chunk_size_entry.get())
-            self.config['commit_interval'] = int(self.commit_interval_entry.get())
+            config = self.config.copy()  # Создаём копию конфига, чтобы не изменять оригинал
+            config['source_type'] = source_type
+            config['target_type'] = target_type
+            config['source_file'] = source_file
+            config['target_file'] = target_file
+            config['db_params'] = self.source_db_params if self.source_db_params else config.get('db_params', {})
+            config['db_params_target'] = self.target_db_params if self.target_db_params else config.get('db_params_target', {})
+            config['chunk_size'] = int(self.chunk_size_entry.get())
+            config['commit_interval'] = int(self.commit_interval_entry.get())
+            config['ga_pop_size'] = self.config.get('ga_pop_size', 20)
+            config['ga_generations'] = self.config.get('ga_generations', 10)
+            config['ga_weights'] = self.config.get('ga_weights', [10, 2, 2, 2, 0.5, 0.5])
+
+            job = ETLJob(config)
+
             def update_progress(value):
                 def update():
                     self.progress["value"] = value
+                    if value > 0 and job.predicted_duration > 0:
+                        remaining = (100 - value) * job.predicted_duration / 100
+                        self.predicted_time_label.config(text=f"Предполагаемое время: {int(remaining)}s осталось")
                 self.root.after(0, update)
 
-            self.config['progress_callback'] = update_progress
-
-            result = run_etl(self.config)
+            config['progress_callback'] = update_progress
+            self.predicted_time_label.config(text=f"Предполагаемое время: {job.predicted_duration}s")
+            result = run_etl(config)
 
             self.log(f"Миграция завершена: {result}")
             self.progress["value"] = 100
+            self.predicted_time_label.config(text="Предполагаемое время: Завершено")
 
         except Exception as e:
             self.log(f"❌ Миграция не удалась: {str(e)}\n{traceback.format_exc()}")
