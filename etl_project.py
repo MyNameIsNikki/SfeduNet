@@ -6,6 +6,7 @@ import logging
 import time
 import gc
 import sqlalchemy as sa
+from sqlalchemy import text  # Добавляем импорт для text()
 import psycopg2
 import mysql.connector
 import traceback
@@ -91,12 +92,19 @@ def create_db_engine(db_type, db_params):
             )
         else:
             raise ValueError(f"Unsupported database type: {db_type}")
+        
         engine = sa.create_engine(connection_string)
         with engine.connect() as conn:
-            conn.execute("SELECT 1")  # Проверка подключения
+            # Используем text() для выполнения raw SQL
+            conn.execute(text("SELECT 1"))
         return engine
+    except sa.exc.OperationalError as e:
+        raise Exception(
+            f"Database connection failed: {str(e)}. "
+            "Check host, port, database, user, password, and ensure the database server is running."
+        )
     except Exception as e:
-        raise Exception(f"Failed to create database engine: {e}")
+        raise Exception(f"Failed to create database engine: {str(e)}")
 
 # Класс миграции с обучением
 class ETLJob:
@@ -127,19 +135,16 @@ class ETLJob:
         self._ensure_data_file()
 
     def _load_or_init_model(self):
-        # Загружаем модель или создаём новую, если её нет
         if os.path.exists(self.model_file):
             with open(self.model_file, "rb") as f:
                 return pickle.load(f)
         return RandomForestRegressor(n_estimators=100, random_state=42)
 
     def _ensure_data_file(self):
-        # Создаём файл данных, если его нет
         if not os.path.exists(self.data_file):
             pd.DataFrame(columns=["file_size", "num_columns", "memory_available", "chunk_size", "commit_interval", "duration"]).to_csv(self.data_file, index=False)
 
     def _predict_parameters_and_duration(self):
-        # Собираем данные для предсказания
         if self.source_type == 'excel':
             workbook = load_workbook(self.source_file, read_only=True)
             sheet = workbook.active
@@ -149,9 +154,9 @@ class ETLJob:
         else:
             engine = create_db_engine(self.source_type, self.db_params)
             with engine.connect() as conn:
-                result = conn.execute(f"SELECT COUNT(*) FROM {self.db_params['table']}")
+                result = conn.execute(text(f"SELECT COUNT(*) FROM {self.db_params['table']}"))
                 num_rows = result.fetchone()[0]
-                result = conn.execute(f"SELECT * FROM {self.db_params['table']} LIMIT 1")
+                result = conn.execute(text(f"SELECT * FROM {self.db_params['table']} LIMIT 1"))
                 num_columns = len(result.keys())
 
         memory_available = psutil.virtual_memory().available // (1024 * 1024)  # В МБ
@@ -162,22 +167,20 @@ class ETLJob:
             "memory_available": [memory_available]
         })
 
-        # Проверяем, обучена ли модель, и используем предсказание или значения по умолчанию
         try:
             predicted = self.model.predict(input_data)[0]
-            self.chunk_size = max(100, int(predicted[0]))  # Минимальный размер чанка
-            self.commit_interval = max(1000, int(predicted[1]))  # Минимальный интервал
-            self.predicted_duration = max(1, int(predicted[2]))  # Предсказанная длительность
+            self.chunk_size = max(100, int(predicted[0]))
+            self.commit_interval = max(1000, int(predicted[1]))
+            self.predicted_duration = max(1, int(predicted[2]))
         except Exception as e:
             self.logger.warning(f"Model not fitted, using default values: {e}")
             self.chunk_size = min(self.config.get('chunk_size', 10000), 50000)
             self.commit_interval = self.config.get('commit_interval', 20000)
-            self.predicted_duration = max(1, int(num_rows / 1000))  # Простая оценка длительности
+            self.predicted_duration = max(1, int(num_rows / 1000))
 
         self.logger.info(f"Predicted parameters: chunk_size={self.chunk_size}, commit_interval={self.commit_interval}, duration={self.predicted_duration}s")
 
     def _log_migration_data(self):
-        # Логируем данные миграции
         data = pd.read_csv(self.data_file)
         new_row = pd.DataFrame({
             "file_size": [self.total_rows_expected],
@@ -192,9 +195,8 @@ class ETLJob:
         self.logger.info(f"Logged migration data.")
 
     def _train_model(self):
-        # Обучаем модель на основе собранных данных
         data = pd.read_csv(self.data_file)
-        if len(data) < 10:  # Минимальное количество записей для обучения
+        if len(data) < 10:
             self.logger.warning("Not enough data for training. Need at least 10 records.")
             return
 
@@ -248,7 +250,7 @@ class ETLJob:
             try:
                 engine = create_db_engine(self.source_type, self.db_params)
                 with engine.connect() as conn:
-                    result = conn.execute(f"SELECT COUNT(*) FROM {self.db_params['table']}")
+                    result = conn.execute(text(f"SELECT COUNT(*) FROM {self.db_params['table']}"))
                     self.total_rows_expected = result.fetchone()[0]
                 self.logger.info(f"Total rows expected: {self.total_rows_expected}")
 
@@ -343,19 +345,17 @@ class ETLJob:
                 conn.close()
             else:
                 raise ValueError(f"Unsupported target type: {self.target_type}")
-
         except Exception as e:
             self.logger.error(f"Ошибка миграции чанка в базу данных: {e}\n{traceback.format_exc()}")
             raise
 
     def run(self):
-        self._predict_parameters_and_duration()  # Предсказываем параметры и длительность
+        self._predict_parameters_and_duration()
         self.logger.info(f"🚀 Starting ETL job: {self.source_type} -> {self.target_type}")
         start = time.time()
         chunk_num = 0
 
         try:
-            # Проверка целевого файла
             if self.target_type == 'excel' and os.path.exists(self.target_file):
                 workbook = load_workbook(self.target_file)
                 worksheet = workbook.active
@@ -366,12 +366,12 @@ class ETLJob:
                         "Предупреждение",
                         f"Целевой файл {self.target_file} уже содержит данные. Перезаписать? (Да - перезаписать, Нет - добавить, Отмена - отменить)"
                     )
-                    if response is None:  # Отмена
+                    if response is None:
                         self.logger.warning("Migration cancelled by user.")
                         return
-                    elif not response:  # Нет - добавить
+                    elif not response:
                         row = worksheet.max_row + 1 if worksheet.max_row is not None else 2
-                    else:  # Да - перезаписать
+                    else:
                         row = 1
                 else:
                     row = 1
@@ -380,11 +380,9 @@ class ETLJob:
                 row = 1
 
             if self.target_type == 'excel':
-                # Используем xlsxwriter для потоковой записи
                 workbook = xlsxwriter.Workbook(self.target_file)
                 worksheet = workbook.add_worksheet()
 
-                # Получаем заголовки из источника
                 if self.source_type == 'excel':
                     if not os.path.exists(self.source_file):
                         raise FileNotFoundError(f"Source file {self.source_file} does not exist.")
@@ -407,15 +405,13 @@ class ETLJob:
                     headers = list(first_chunk.columns)
                     stream = itertools.chain([first_chunk], stream)
 
-                # Записываем заголовки, если их нет
                 if row == 1:
                     for col_num, col_name in enumerate(headers):
                         worksheet.write(0, col_num, str(col_name) if col_name is not None else "")
                     row = 1
                 else:
-                    row = max(row - 1, 1)  # Учитываем, что строка уже занята заголовками
+                    row = max(row - 1, 1)
 
-                # Потоковая запись в Excel
                 if self.source_type == 'excel':
                     chunk_data = []
                     for src_row in sheet_source.rows:
@@ -438,7 +434,6 @@ class ETLJob:
                             chunk_num += 1
                             chunk_data = []
 
-                    # Обрабатываем оставшиеся строки
                     if chunk_data:
                         for r, data_row in enumerate(chunk_data, start=row):
                             safe_row = [str(val) if val is not None else "" for val in data_row]
@@ -453,7 +448,6 @@ class ETLJob:
 
                     workbook_source.close()
                 else:
-                    # Источник — база данных
                     for chunk in stream:
                         chunk_num += 1
                         for r, row_data in enumerate(chunk.values, start=row):
@@ -469,7 +463,6 @@ class ETLJob:
                 workbook.close()
                 self.logger.info(f"📝 Migrated {self.total_rows} rows to {self.target_file}")
             else:
-                # Для баз данных
                 stream = self.stream_data()
                 first_chunk = next(stream, None)
                 if first_chunk is None:
@@ -478,7 +471,7 @@ class ETLJob:
 
                 engine = create_db_engine(self.target_type, self.db_params_target)
                 with engine.connect() as conn:
-                    conn.execute(f"DROP TABLE IF EXISTS {self.db_params_target['table']}")
+                    conn.execute(text(f"DROP TABLE IF EXISTS {self.db_params_target['table']}"))
                 self.logger.info(f"🧹 Target table '{self.db_params_target['table']}' cleared.")
                 first_chunk.to_sql(self.db_params_target['table'], engine, if_exists='replace', index=False)
 
@@ -500,16 +493,14 @@ class ETLJob:
             self.duration = round(time.time() - start, 2)
             self.logger.info(f"✅ ETL finished in {self.duration}s, {self.total_rows} rows migrated.")
             
-            self._log_migration_data()  # Логируем данные после миграции
-            self._train_model()  # Обучаем модель после каждой миграции
-
+            self._log_migration_data()
+            self._train_model()
             validate_migration(self.config, self.logger)
-
         except Exception as e:
             self.logger.error(f"❌ ETL failed: {e}\n{traceback.format_exc()}")
             raise
 
-# Загрузка конфигурации без изменений
+# Загрузка конфигурации
 def load_config(path='config.yaml'):
     try:
         with open(path, 'r', encoding='utf-8') as f:
@@ -718,23 +709,19 @@ class ETLApp:
             self.log(f"Выбрана база данных цели: {self.target_file_entry.get()}")
 
     def open_db_config_dialog(self):
-        # Диалоговое окно для настройки подключения к БД
         dialog = tk.Toplevel(self.root)
         dialog.title("Настройка подключения к БД")
         dialog.geometry("600x400")
 
-        # Вкладки для источника и цели
         notebook = ttk.Notebook(dialog)
         notebook.pack(fill="both", expand=True)
 
-        # Вкладка для источника
         source_frame = ttk.Frame(notebook)
         notebook.add(source_frame, text="Источник")
         tk.Label(source_frame, text=f"Параметры источника ({self.source_type.get().upper()}):").pack(pady=5)
         source_dialog = DatabaseDialog(source_frame, "Источник", self.source_type.get())
         source_dialog.pack(fill="both", expand=True)
 
-        # Вкладка для цели
         target_frame = ttk.Frame(notebook)
         notebook.add(target_frame, text="Цель")
         tk.Label(target_frame, text=f"Параметры цели ({self.target_type.get().upper()}):").pack(pady=5)
@@ -784,7 +771,7 @@ class ETLApp:
         self.log("Запуск миграции...")
         self.progress["value"] = 0
         try:
-            config = self.config.copy()  # Создаём копию конфига, чтобы не изменять оригинал
+            config = self.config.copy()
             config['source_type'] = source_type
             config['target_type'] = target_type
             config['source_file'] = source_file
@@ -814,7 +801,6 @@ class ETLApp:
             self.log(f"Миграция завершена: {result}")
             self.progress["value"] = 100
             self.predicted_time_label.config(text="Предполагаемое время: Завершено")
-
         except Exception as e:
             self.log(f"❌ Миграция не удалась: {str(e)}\n{traceback.format_exc()}")
             messagebox.showerror("Ошибка", f"Миграция не удалась: {str(e)}")
